@@ -1,0 +1,892 @@
+// APM 监控前端逻辑（多数据源：APM / MySQL / Redis / MongoDB 可同时启用）
+const { invoke } = window.__TAURI__.core;
+const { animate, stagger } = window.anime;
+
+const REGIONS = [
+  ["ap-shanghai", "上海"],
+  ["ap-guangzhou", "广州"],
+  ["ap-beijing", "北京"],
+  ["ap-nanjing", "南京"],
+  ["ap-chengdu", "成都"],
+  ["ap-chongqing", "重庆"],
+  ["ap-shenzhen-fsi", "深圳金融"],
+  ["ap-shanghai-fsi", "上海金融"],
+  ["ap-beijing-fsi", "北京金融"],
+  ["ap-hongkong", "中国香港"],
+  ["ap-singapore", "新加坡"],
+  ["ap-seoul", "首尔"],
+  ["ap-tokyo", "东京"],
+  ["ap-silicon-valley", "硅谷"],
+  ["ap-frankfurt", "法兰克福"],
+];
+
+const QUICK_RANGES = [
+  ["15m", "最近15分钟", "15分钟"],
+  ["30m", "最近30分钟", "30分钟"],
+  ["1h", "最近1小时", "1小时"],
+  ["2h", "最近2小时", "2小时"],
+  ["6h", "最近6小时", "6小时"],
+  ["12h", "最近12小时", "12小时"],
+  ["24h", "最近24小时", "24小时"],
+  ["today", "今天", "今日"],
+  ["yesterday", "昨天", "昨日"],
+  ["3d", "最近3天", "3天"],
+  ["7d", "最近7天", "7天"],
+];
+
+// APM 指标（名称均经控制台接口实测确认；刷新按钮返回后端内置的同款清单）
+const DEFAULT_METRICS = [
+  { name: "request_count", view: "service_metric", cn: "请求量" },
+  { name: "qps_avg", view: "computed", cn: "平均(次/秒)" }, // 计算型：请求量÷窗口秒数
+  { name: "error_request_count", view: "service_metric", cn: "异常请求量" },
+  { name: "error_req_rate_avg", view: "service_metric", cn: "错误率" },
+  { name: "duration_p99", view: "service_metric", cn: "P99耗时" },
+  { name: "duration_p95", view: "service_metric", cn: "P95耗时" },
+  { name: "duration_avg", view: "service_metric", cn: "平均耗时" },
+  { name: "duration_max", view: "service_metric", cn: "最大耗时" },
+];
+
+// 数据源
+const SOURCE_ORDER = ["apm", "mysql", "redis", "mongodb"];
+const SOURCE_NAMES = { apm: "APM 应用", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
+const DB_TITLES = { mysql: "MySQL 实例", redis: "Redis 实例", mongodb: "MongoDB 实例" };
+const DB_METRICS = {
+  mysql: [
+    { name: "cpu", cn: "CPU最高点" },
+    { name: "mem", cn: "内存最高点" },
+    { name: "qps", cn: "峰值QPS" },
+    { name: "conn", cn: "最高连接数" },
+    { name: "disk", cn: "磁盘使用率" },
+  ],
+  redis: [
+    { name: "score", cn: "健康得分" },
+    { name: "cpu", cn: "CPU使用率" },
+    { name: "mem", cn: "内存使用率" },
+    { name: "conn_util", cn: "连接使用率" },
+    { name: "hit", cn: "读请求命中率" },
+  ],
+  mongodb: [
+    { name: "score", cn: "健康得分" },
+    { name: "cpu", cn: "最大CPU使用率" },
+    { name: "mem", cn: "内存百分比" },
+    { name: "disk", cn: "磁盘使用百分比" },
+  ],
+};
+
+let cfg = null;
+let sourcesData = {}; // {type: [{name, label?, requestCount}]}
+let activeListTab = "apm";
+let activeMetricTab = "apm";
+let saveTimer = null;
+
+const $ = (id) => document.getElementById(id);
+const isEnabled = (t) => (cfg.enabledSources || []).includes(t);
+const dbInstances = (t) => (cfg.selectedDbInstances && cfg.selectedDbInstances[t]) || [];
+
+// ---------- 配置持久化 ----------
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => invoke("save_config", { config: cfg }).catch(showErr), 400);
+}
+
+function showErr(e) {
+  $("status").classList.remove("ok");
+  $("status").textContent = String(e);
+}
+
+function showOk(msg) {
+  $("status").classList.add("ok");
+  $("status").textContent = msg;
+  setTimeout(() => { if ($("status").textContent === msg) $("status").textContent = ""; }, 5000);
+}
+
+// ---------- 时间 ----------
+function resolveRange() {
+  const now = Math.floor(Date.now() / 1000);
+  const day = (offsetDays) => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return Math.floor(d.getTime() / 1000) + offsetDays * 86400;
+  };
+  const dur = { "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "6h": 21600, "12h": 43200, "24h": 86400, "3d": 259200, "7d": 604800 };
+  if (cfg.useCustom) {
+    const s = Math.floor(new Date(cfg.customStart).getTime() / 1000);
+    const e = Math.floor(new Date(cfg.customEnd).getTime() / 1000);
+    if (!s || !e || s >= e) return null;
+    return { start: s, end: e, label: `${cfg.customStart.replace("T", " ")} ~ ${cfg.customEnd.replace("T", " ")}`, prefix: "", dbPrefix: "" };
+  }
+  if (cfg.quickRange === "today") return { start: day(0), end: now, label: "今天", prefix: "今日", dbPrefix: "今日" };
+  if (cfg.quickRange === "yesterday") return { start: day(-1), end: day(0), label: "昨天", prefix: "昨日", dbPrefix: "昨日" };
+  const d = dur[cfg.quickRange];
+  if (!d) return null;
+  const q = QUICK_RANGES.find((x) => x[0] === cfg.quickRange);
+  return { start: now - d, end: now, label: q[1], prefix: q[2], dbPrefix: `近${q[2]}` };
+}
+
+function updateRangeHint() {
+  const r = resolveRange();
+  $("range-hint").textContent = r ? `查询区间：${r.label}` : "请先设置有效的时间范围";
+}
+
+// ---------- 数据源 chips ----------
+function renderSourceChips() {
+  const box = $("source-chips");
+  box.innerHTML = "";
+  for (const t of SOURCE_ORDER) {
+    const chip = document.createElement("button");
+    chip.className = "chip" + (isEnabled(t) ? " active" : "");
+    chip.textContent = SOURCE_NAMES[t];
+    chip.onclick = () => {
+      const i = cfg.enabledSources.indexOf(t);
+      if (i >= 0) {
+        if (cfg.enabledSources.length === 1) return showErr("至少保留一个数据源");
+        cfg.enabledSources.splice(i, 1);
+        if (!isEnabled(activeListTab)) activeListTab = cfg.enabledSources[0];
+        if (!isEnabled(activeMetricTab)) activeMetricTab = cfg.enabledSources[0];
+      } else {
+        cfg.enabledSources.push(t);
+        if (t !== "apm" && !(cfg.selectedMetrics || []).some((m) => m.view === t)) {
+          cfg.selectedMetrics.push(...DB_METRICS[t].map((d) => ({ ...d, view: t })));
+        }
+      }
+      renderSourceChips();
+      renderTabs();
+      renderApps(false);
+      renderMetrics();
+      updateSettingsHint();
+      scheduleSave();
+      if (isEnabled(t) && !sourcesData[t] && (cfg.cookie || cfg.secretId)) loadSources([t]);
+    };
+    box.appendChild(chip);
+  }
+}
+
+// ---------- Tab 页 ----------
+function renderTabs() {
+  renderListTabs();
+  renderMetricTabs();
+}
+
+function renderListTabs() {
+  const box = $("list-tabs");
+  box.innerHTML = "";
+  for (const t of SOURCE_ORDER) {
+    if (!isEnabled(t)) continue;
+    const btn = document.createElement("button");
+    btn.className = "tab" + (t === activeListTab ? " active" : "");
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = selectedListOf(t).length;
+    btn.appendChild(document.createTextNode(SOURCE_NAMES[t]));
+    btn.appendChild(badge);
+    btn.onclick = () => {
+      activeListTab = t;
+      // 右侧指标 Tab 跟随左侧切换
+      activeMetricTab = t;
+      renderListTabs();
+      renderMetricTabs();
+      renderMetrics();
+      renderApps(false);
+      if (!sourcesData[t] && (cfg.cookie || cfg.secretId)) loadSources([t]);
+    };
+    box.appendChild(btn);
+  }
+}
+
+function renderMetricTabs() {
+  const box = $("metric-tabs");
+  box.innerHTML = "";
+  for (const t of SOURCE_ORDER) {
+    if (!isEnabled(t)) continue;
+    const btn = document.createElement("button");
+    btn.className = "tab" + (t === activeMetricTab ? " active" : "");
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = cfg.selectedMetrics.filter((m) =>
+      t === "apm" ? ["service_metric", "computed"].includes(m.view) : m.view === t
+    ).length;
+    btn.appendChild(document.createTextNode(SOURCE_NAMES[t]));
+    btn.appendChild(badge);
+    btn.onclick = () => {
+      activeMetricTab = t;
+      renderMetricTabs();
+      renderMetrics();
+    };
+    box.appendChild(btn);
+  }
+}
+
+// ---------- 应用 / 实例列表 ----------
+async function loadSources(types) {
+  $("btn-load-apps").disabled = true;
+  let okCount = 0;
+  try {
+    for (const t of types) {
+      try {
+        if (t === "apm") {
+          sourcesData[t] = await invoke("list_apps", { config: cfg });
+        } else {
+          const list = await invoke("list_db_instances", { config: cfg, dbType: t });
+          sourcesData[t] = list.map((d) => ({ name: d.id, label: d.name, requestCount: 0 }));
+        }
+        okCount++;
+      } catch (e) {
+        showErr(`${SOURCE_NAMES[t]}: ${e}`);
+      }
+    }
+    renderApps(false);
+    renderListTabs();
+    if (okCount) showOk(`已加载 ${okCount} 个数据源的列表`);
+  } finally {
+    $("btn-load-apps").disabled = false;
+  }
+}
+
+function selectedListOf(t) {
+  return t === "apm" ? cfg.selectedApps : dbInstances(t);
+}
+
+function toggleSelected(t, name, checked) {
+  const list = selectedListOf(t);
+  const i = list.indexOf(name);
+  if (checked && i < 0) list.push(name);
+  if (!checked && i >= 0) list.splice(i, 1);
+  if (t !== "apm") {
+    cfg.selectedDbInstances = cfg.selectedDbInstances || {};
+    cfg.selectedDbInstances[t] = list;
+  }
+  $("selected-app-count").textContent = selectedListOf(activeListTab).length;
+  renderListTabs();
+  scheduleSave();
+}
+
+function renderApps(animateIn) {
+  const t = activeListTab;
+  if (!isEnabled(t)) {
+    const first = (cfg.enabledSources || []).find(isEnabled);
+    if (first) { activeListTab = t = first; renderListTabs(); }
+    else return;
+  }
+  const kw = ($("app-search")?.value || "").trim().toLowerCase();
+  const list = $("app-list");
+  list.innerHTML = "";
+  const items = sourcesData[t] || [];
+  const shown = items.filter((a) => (a.name + (a.label || "")).toLowerCase().includes(kw));
+  for (const a of shown) {
+    const row = document.createElement("label");
+    row.className = "check-item";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selectedListOf(t).includes(a.name);
+    cb.onchange = () => toggleSelected(t, a.name, cb.checked);
+    row.appendChild(cb);
+    const name = document.createElement("span");
+    name.textContent = t !== "apm" && a.label ? `${a.name}（${a.label}）` : a.name;
+    row.appendChild(name);
+    const cnt = document.createElement("span");
+    cnt.className = "cnt";
+    cnt.textContent = t === "apm" ? `${fmtCount(a.requestCount)} 次` : "";
+    row.appendChild(cnt);
+    list.appendChild(row);
+  }
+  if (!shown.length) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.style.padding = "8px";
+    empty.textContent = items.length
+      ? "没有匹配的条目"
+      : `${SOURCE_NAMES[t]} 列表未加载，点「加载列表」拉取`;
+    list.appendChild(empty);
+  }
+  $("selected-app-count").textContent = selectedListOf(t).length;
+  if (animateIn && shown.length) {
+    animate(".check-item", {
+      translateY: [8, 0],
+      opacity: [0, 1],
+      delay: stagger(4),
+      duration: 280,
+      ease: "outQuad",
+    });
+  }
+}
+
+// ---------- 指标 ----------
+function renderMetrics() {
+  const t = activeMetricTab;
+  if (!isEnabled(t)) {
+    const first = (cfg.enabledSources || []).find(isEnabled);
+    if (first) { activeMetricTab = t = first; renderMetricTabs(); }
+    else return;
+  }
+  const list = $("metric-list");
+  list.innerHTML = "";
+  const addGroup = (title, defs) => {
+    if (!defs.length) return;
+    const g = document.createElement("div");
+    g.className = "metric-group";
+    g.textContent = title;
+    list.appendChild(g);
+    for (const d of defs) {
+      const row = document.createElement("label");
+      row.className = "check-item";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = cfg.selectedMetrics.some((m) => m.name === d.name && m.view === d.view);
+      cb.onchange = () => {
+        if (cb.checked) {
+          cfg.selectedMetrics.push({ ...d });
+        } else {
+          cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !(m.name === d.name && m.view === d.view));
+        }
+        renderMetricTabs();
+        scheduleSave();
+      };
+      row.appendChild(cb);
+      const label = document.createElement("span");
+      label.textContent = t === "apm" ? `${d.cn || d.name} (${d.name})` : d.cn;
+      row.appendChild(label);
+      list.appendChild(row);
+    }
+  };
+  if (t === "apm") {
+    const defs = cfg.metricCache.length ? cfg.metricCache : DEFAULT_METRICS;
+    addGroup("应用指标", defs.filter((d) => d.view === "service_metric"));
+    addGroup("计算指标", defs.filter((d) => d.view === "computed"));
+  } else {
+    addGroup(SOURCE_NAMES[t], DB_METRICS[t].map((d) => ({ ...d, view: t })));
+  }
+}
+
+async function refreshMetrics() {
+  $("btn-refresh-metrics").disabled = true;
+  try {
+    const defs = await invoke("refresh_metric_defs", { config: cfg });
+    if (!defs.length) throw "指标清单为空";
+    cfg.metricCache = defs;
+    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !["service_metric", "computed"].includes(m.view) || defs.some((d) => d.name === m.name && d.view === m.view));
+    renderMetrics();
+    scheduleSave();
+    showOk(`指标清单已刷新，共 ${defs.length} 个`);
+  } catch (e) {
+    showErr(e);
+  } finally {
+    $("btn-refresh-metrics").disabled = false;
+  }
+}
+
+// ---------- 数值格式化 ----------
+function fmtCount(v) {
+  if (!isFinite(v)) return String(v);
+  if (Math.abs(v) >= 10000) {
+    const w = v / 10000;
+    return `${(Math.round(w * 10) / 10).toString().replace(/\.0$/, "")}W`;
+  }
+  return Number.isInteger(v) ? String(v) : String(Math.round(v * 10) / 10);
+}
+
+function fmtRate(v) {
+  if (!isFinite(v)) return String(v);
+  return `${v.toFixed(2)}%`;
+}
+
+function fmtValue(name, v) {
+  if (name.includes("rate")) return fmtRate(v);
+  if (name.startsWith("duration")) return `${Math.round(v * 10) / 10} ms`;
+  return fmtCount(v);
+}
+
+// ---------- 查询与 Markdown 展示 ----------
+function mdEscape(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function mdRender(md) {
+  // 极简 Markdown：**加粗** + 换行
+  return mdEscape(md)
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/\n/g, "<br>");
+}
+
+async function query() {
+  const r = resolveRange();
+  if (!r) return showErr("时间范围无效");
+
+  const tasks = [];
+  if (isEnabled("apm")) {
+    if (!cfg.instanceId) return showErr("APM 已启用，请先填写业务系统 ID");
+    if (!cfg.selectedApps.length) return showErr("APM 已启用，请先选择应用");
+    const metrics = cfg.selectedMetrics.filter((m) => ["service_metric", "computed"].includes(m.view));
+    if (!metrics.length) return showErr("APM 已启用，请先勾选指标");
+    tasks.push(
+      invoke("query_metrics", {
+        config: cfg,
+        startTs: r.start,
+        endTs: r.end,
+        apps: cfg.selectedApps,
+        metrics,
+      }).then((results) => ({ src: "apm", results }))
+    );
+  }
+  for (const t of ["mysql", "redis", "mongodb"]) {
+    if (!isEnabled(t)) continue;
+    const instances = dbInstances(t);
+    if (!instances.length) return showErr(`${SOURCE_NAMES[t]} 已启用，请先选择实例`);
+    if (!cfg.selectedMetrics.some((m) => m.view === t)) return showErr(`${SOURCE_NAMES[t]} 已启用，请先勾选指标`);
+    tasks.push(
+      invoke("query_db_metrics", {
+        config: cfg,
+        dbType: t,
+        startTs: r.start,
+        endTs: r.end,
+        instances,
+      }).then((results) => ({ src: t, results }))
+    );
+  }
+  if (!tasks.length) return showErr("请先启用数据源并选择对象");
+
+  for (const id of ["btn-query", "btn-query-2"]) {
+    const b = $(id);
+    b.disabled = true;
+    b.classList.add("loading");
+  }
+  $("status").textContent = "查询中…";
+  try {
+    const settled = await Promise.allSettled(tasks);
+    const groups = [];
+    for (const s of settled) {
+      if (s.status === "fulfilled") groups.push(s.value);
+      else groups.push({ src: "error", results: [], error: String(s.reason) });
+    }
+    renderResults(groups, r);
+    const total = groups.reduce((n, g) => n + g.results.length, 0);
+    showOk(`统计完成：${total} 个对象`);
+  } catch (e) {
+    showErr(e);
+  } finally {
+    for (const id of ["btn-query", "btn-query-2"]) {
+      const b = $(id);
+      b.disabled = false;
+      b.classList.remove("loading");
+    }
+  }
+}
+
+function dbLines(app, range, src) {
+  const v = (n) => {
+    const x = app.values.find((y) => y.name === n);
+    return x ? x.value : undefined;
+  };
+  const pct = (x) => (x === undefined ? "-" : `${Math.round(x * 10) / 10}%`);
+  const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === src);
+  const p = range.dbPrefix;
+  const lines = [`**${app.name}**`, `统计窗口：${range.label}`];
+  if (src === "mysql") {
+    if (has("cpu")) lines.push(`${p}CPU最高点：${pct(v("cpu"))}`);
+    if (has("mem")) lines.push(`${p}内存最高点：${pct(v("mem"))}`);
+    if (has("qps")) {
+      const q = v("qps");
+      lines.push(`${p}峰值QPS：${q !== undefined ? `${fmtCount(q)} 次/秒` : "-"}`);
+    }
+    if (has("conn")) {
+      const c = v("conn");
+      const cl = v("conn_limit");
+      const txt =
+        c === undefined
+          ? "-"
+          : cl !== undefined
+            ? `${fmtCount(c)}/${fmtCount(cl)} 个`
+            : `${fmtCount(c)} 个`;
+      lines.push(`${p}最高连接数：${txt}`);
+    }
+    if (has("disk")) lines.push(`磁盘使用率：${pct(v("disk"))}`);
+  } else if (src === "redis") {
+    if (has("score")) {
+      const s = v("score");
+      lines.push(`健康得分：${s !== undefined ? `${Math.round(s)} 分` : "-"}`);
+    }
+    if (has("cpu")) lines.push(`${p}CPU使用率：${pct(v("cpu"))}`);
+    if (has("mem")) lines.push(`${p}内存使用率：${pct(v("mem"))}`);
+    if (has("conn_util")) lines.push(`${p}连接使用率：${pct(v("conn_util"))}`);
+    if (has("hit")) lines.push(`${p}读请求命中率：${pct(v("hit"))}`);
+  } else if (src === "mongodb") {
+    if (has("score")) {
+      const s = v("score");
+      lines.push(`健康得分：${s !== undefined ? `${Math.round(s)} 分` : "-"}`);
+    }
+    if (has("cpu")) lines.push(`${p}最大CPU使用率：${pct(v("cpu"))}`);
+    if (has("mem")) lines.push(`${p}内存百分比：${pct(v("mem"))}`);
+    if (has("disk")) lines.push(`磁盘使用百分比：${pct(v("disk"))}`);
+  }
+  if (app.error) lines.push(`（查询出错：${app.error}）`);
+  return lines;
+}
+
+function apmLines(app, range) {
+  const lines = [`**服务名：${app.name}**`, `统计窗口：${range.label}`];
+  const secs = Math.max(1, range.end - range.start);
+  for (const d of cfg.selectedMetrics) {
+    if (!["service_metric", "computed"].includes(d.view)) continue;
+    const label = `${range.prefix}${d.cn || d.name}`;
+    let text;
+    if (d.view === "computed") {
+      if (d.name === "qps_avg") {
+        const req = app.values.find((x) => x.name === "request_count");
+        text = req !== undefined ? `${Math.round((req.value / secs) * 10) / 10} 次/秒` : "-";
+      } else {
+        text = "-";
+      }
+    } else {
+      const v = app.values.find((x) => x.name === d.name);
+      text = v !== undefined ? fmtValue(d.name, v.value) : "-";
+    }
+    lines.push(`${label}：${text}`);
+  }
+  if (app.error) lines.push(`（查询出错：${app.error}）`);
+  return lines;
+}
+
+function renderResults(groups, range) {
+  const box = $("results");
+  box.innerHTML = "";
+  const blocks = [];
+  for (const g of groups) {
+    if (g.src === "error") {
+      blocks.push([`**（${g.error}）**`]);
+      continue;
+    }
+    for (const app of g.results) {
+      blocks.push(g.src === "apm" ? apmLines(app, range) : dbLines(app, range, g.src));
+    }
+  }
+  for (const lines of blocks) {
+    const md = lines.join("\n");
+    // 复制输出为纯文本（去掉 Markdown 加粗符号）
+    const plain = lines.map((l) => l.replace(/\*\*/g, "")).join("\n");
+
+    const block = document.createElement("div");
+    block.className = "result-block";
+    const html = document.createElement("div");
+    html.dataset.md = plain;
+    html.innerHTML = mdRender(md);
+    block.appendChild(html);
+    const btn = document.createElement("button");
+    btn.className = "btn-mini copy";
+    btn.textContent = "复制";
+    btn.onclick = () => copyText(plain, btn);
+    block.appendChild(btn);
+    box.appendChild(block);
+  }
+  animate(".result-block", {
+    translateY: [24, 0],
+    opacity: [0, 1],
+    scale: [0.98, 1],
+    delay: stagger(90),
+    duration: 500,
+    ease: "outExpo",
+  });
+}
+
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+  if (btn) {
+    btn.textContent = "已复制";
+    btn.style.color = "var(--ok)";
+    setTimeout(() => { btn.textContent = "复制"; btn.style.color = ""; }, 1500);
+  }
+}
+
+// ---------- curl 粘贴解析 ----------
+// 兼容 Windows cmd 版（^" ^& ^% 转义）与 bash 版（"..." '...'）两种 Copy as cURL 格式
+function parseCurl(text) {
+  // 去掉 cmd 转义符 ^（^\^" → \" 恰好是正确的引号转义）
+  const s = text.replace(/\r?\n\s*/g, " ").replace(/\^(.)/g, "$1");
+  const toks = [];
+  let i = 0;
+  while (i < s.length) {
+    while (s[i] === " ") i++;
+    if (i >= s.length) break;
+    let cur = "";
+    while (i < s.length && s[i] !== " ") {
+      const c = s[i];
+      if (c === '"') {
+        i++;
+        while (i < s.length && s[i] !== '"') {
+          if (s[i] === "\\" && (s[i + 1] === '"' || s[i + 1] === "\\")) { cur += s[i + 1]; i += 2; }
+          else { cur += s[i]; i++; }
+        }
+        i++;
+      } else if (c === "'") {
+        i++;
+        while (i < s.length && s[i] !== "'") { cur += s[i]; i++; }
+        i++;
+      } else { cur += c; i++; }
+    }
+    toks.push(cur);
+  }
+
+  const out = { url: "", cookie: "", team: "", rid: "", isApmApi: false };
+  for (let k = 0; k < toks.length; k++) {
+    const t = toks[k];
+    if (t === "--url" && toks[k + 1]) { out.url = toks[k + 1]; k++; }
+    else if (t === "-b" || t === "--cookie") { out.cookie = toks[k + 1] || ""; k++; }
+    else if (t === "-H") {
+      const h = toks[k + 1] || ""; k++;
+      const m = h.match(/^cookie:\s*(.+)$/i);
+      if (m) out.cookie = m[1].trim();
+    } else if (t === "curl" || t.startsWith("-")) { /* skip */ }
+    else if (!out.url) out.url = t;
+  }
+  if (!out.url) return out;
+
+  let params;
+  try { params = new URL(out.url).searchParams; } catch { return out; }
+  out.isApmApi = /console-hc\.cloud\.tencent\.com\/_api\/apm\//.test(out.url);
+  out.uin = params.get("uin") || "";
+  out.ownerUin = params.get("ownerUin") || "";
+  out.csrfCode = params.get("csrfCode") || "";
+
+  // team / rid 藏在 URL 自身、referer 头或 from 参数里（可能多层编码），在全文本中搜
+  const hunt = (name) => {
+    const direct = params.get(name);
+    if (direct) return direct;
+    const deep = decodeURIComponentSafe(s).match(new RegExp(`[?&]${name}=([^&"'\\s]+)`));
+    return deep ? deep[1] : "";
+  };
+  out.team = hunt("team");
+  out.rid = hunt("rid");
+  return out;
+}
+
+function decodeURIComponentSafe(s) {
+  try { return decodeURIComponent(s); } catch { return s; }
+}
+
+function parseCurlFill() {
+  const text = $("curl-paste").value;
+  if (!text.trim()) { $("curl-result").textContent = "请先粘贴 curl"; return; }
+  const r = parseCurl(text);
+
+  if (r.cookie) { $("cookie").value = r.cookie; cfg.cookie = r.cookie; }
+  if (r.uin) $("uin").value = r.uin;
+  if (r.ownerUin) $("owner-uin").value = r.ownerUin;
+  if (r.csrfCode) $("csrf-code").value = r.csrfCode;
+  if (!r.uin || !r.ownerUin) { const p = parseCookieIds(cfg.cookie || ""); if (!$("uin").value && p.uin) $("uin").value = p.uin; if (!$("owner-uin").value && p.ownerUin) $("owner-uin").value = p.ownerUin; }
+  if (r.team) $("instance-id").value = r.team;
+  if (r.rid) $("region-id").value = parseInt(r.rid) || cfg.regionId;
+  cfg.uin = $("uin").value.trim();
+  cfg.ownerUin = $("owner-uin").value.trim();
+  cfg.csrfCode = $("csrf-code").value.trim();
+  cfg.instanceId = $("instance-id").value.trim();
+  cfg.regionId = parseInt($("region-id").value) || 4;
+  scheduleSave();
+
+  const has = (v) => (v ? "✓" : "✗");
+  let msg = `Cookie ${has(r.cookie)}　uin ${has(cfg.uin)}　ownerUin ${has(cfg.ownerUin)}　csrfCode ${has(cfg.csrfCode)}　team ${cfg.instanceId ? "✓ " + cfg.instanceId : "✗"}　regionId ${cfg.regionId}`;
+  if (!r.isApmApi && !r.cookie) {
+    msg += "　⚠ 这不是 _api/apm/ 接口请求且提不到 Cookie：请在 F12 网络面板找 console-hc.cloud.tencent.com/_api/apm/… 的请求，「复制为 cURL」再贴一次";
+  }
+  $("curl-result").textContent = msg;
+}
+
+function parseCookieIds(cookieStr) {
+  const out = {};
+  for (const pair of cookieStr.split(";")) {
+    const i = pair.indexOf("=");
+    if (i < 0) continue;
+    const k = pair.slice(0, i).trim();
+    const v = pair.slice(i + 1).trim();
+    if (k === "uin") out.uin = v.replace(/^[oO]/, "");
+    if (k === "ownerUin") out.ownerUin = v.replace(/^[oO]/, "").replace(/[gG]$/, "");
+  }
+  return out;
+}
+
+// ---------- 事件绑定与初始化 ----------
+function bindConfigInputs() {
+  $("region").onchange = () => { cfg.region = $("region").value; scheduleSave(); };
+  $("region-id").oninput = () => { cfg.regionId = parseInt($("region-id").value) || 4; scheduleSave(); };
+  $("instance-id").oninput = () => { cfg.instanceId = $("instance-id").value.trim(); scheduleSave(); };
+  $("secret-id").oninput = () => { cfg.secretId = $("secret-id").value.trim(); scheduleSave(); };
+  $("secret-key").oninput = () => { cfg.secretKey = $("secret-key").value; scheduleSave(); };
+  $("uin").oninput = () => { cfg.uin = $("uin").value.trim(); scheduleSave(); };
+  $("owner-uin").oninput = () => { cfg.ownerUin = $("owner-uin").value.trim(); scheduleSave(); };
+  $("csrf-code").oninput = () => { cfg.csrfCode = $("csrf-code").value.trim(); scheduleSave(); };
+  $("cookie").oninput = () => { cfg.cookie = $("cookie").value; scheduleSave(); };
+  for (const radio of document.querySelectorAll('input[name="auth"]')) {
+    radio.onchange = () => {
+      if (!radio.checked) return;
+      cfg.authMode = radio.value;
+      $("auth-secret").classList.toggle("hidden", radio.value !== "secret");
+      $("auth-cookie").classList.toggle("hidden", radio.value !== "cookie");
+      scheduleSave();
+    };
+  }
+  for (const chip of $("quick-ranges").querySelectorAll(".chip")) {
+    chip.onclick = () => {
+      cfg.useCustom = false;
+      cfg.quickRange = chip.dataset.key;
+      renderTimeUI();
+      scheduleSave();
+    };
+  }
+  $("custom-start").onchange = () => { cfg.customStart = $("custom-start").value; cfg.useCustom = true; renderTimeUI(); scheduleSave(); };
+  $("custom-end").onchange = () => { cfg.customEnd = $("custom-end").value; cfg.useCustom = true; renderTimeUI(); scheduleSave(); };
+  $("app-search").oninput = () => renderApps(false);
+  $("btn-load-apps").onclick = () => loadSources([activeListTab]);
+  $("btn-app-all").onclick = () => {
+    const t = activeListTab;
+    const kw = $("app-search").value.trim().toLowerCase();
+    const list = selectedListOf(t);
+    for (const a of (sourcesData[t] || []).filter((x) => (x.name + (x.label || "")).toLowerCase().includes(kw))) {
+      if (!list.includes(a.name)) list.push(a.name);
+    }
+    if (t !== "apm") {
+      cfg.selectedDbInstances = cfg.selectedDbInstances || {};
+      cfg.selectedDbInstances[t] = list;
+    }
+    renderApps(false);
+    renderListTabs();
+    scheduleSave();
+  };
+  $("btn-app-none").onclick = () => {
+    if (activeListTab === "apm") cfg.selectedApps = [];
+    else {
+      cfg.selectedDbInstances = cfg.selectedDbInstances || {};
+      cfg.selectedDbInstances[activeListTab] = [];
+    }
+    renderApps(false);
+    renderListTabs();
+    scheduleSave();
+  };
+  $("btn-refresh-metrics").onclick = refreshMetrics;
+  $("btn-metrics-default").onclick = () => {
+    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !["service_metric", "computed"].includes(m.view));
+    cfg.selectedMetrics.push(...DEFAULT_METRICS.map((d) => ({ ...d })));
+    renderMetrics();
+    scheduleSave();
+  };
+  $("btn-query").onclick = query;
+  $("btn-query-2").onclick = query;
+  $("btn-copy-all").onclick = () => {
+    const all = [...document.querySelectorAll(".result-block > div")].map((d) => d.dataset.md).join("\n\n");
+    if (all) { copyText(all, null); showOk("已复制全部"); }
+  };
+  $("btn-parse-curl").onclick = parseCurlFill;
+  $("btn-validate-cookie").onclick = async () => {
+    $("cookie-result").textContent = "校验中…";
+    try {
+      $("cookie-result").textContent = await invoke("validate_cookie", { config: cfg });
+    } catch (e) {
+      $("cookie-result").textContent = String(e);
+    }
+  };
+}
+
+function renderTimeUI() {
+  for (const chip of $("quick-ranges").querySelectorAll(".chip")) {
+    chip.classList.toggle("active", !cfg.useCustom && chip.dataset.key === cfg.quickRange);
+  }
+  $("custom-range").classList.toggle("hidden", !cfg.useCustom);
+  updateRangeHint();
+}
+
+function updateSettingsHint() {
+  const ds = (cfg.enabledSources || []).map((t) => SOURCE_NAMES[t] || t).join(" + ");
+  const auth = cfg.authMode === "cookie" ? "Cookie 模式" : "密钥模式";
+  $("settings-hint").textContent = `已启用：${ds}（${auth}）`;
+}
+
+async function init() {
+  for (const [val, label] of REGIONS) {
+    const opt = document.createElement("option");
+    opt.value = val;
+    opt.textContent = label;
+    $("region").appendChild(opt);
+  }
+  for (const [key, label] of QUICK_RANGES) {
+    const chip = document.createElement("button");
+    chip.className = "chip";
+    chip.dataset.key = key;
+    chip.textContent = label;
+    $("quick-ranges").appendChild(chip);
+  }
+
+  cfg = await invoke("load_config");
+  if (!cfg.selectedMetrics.length) cfg.selectedMetrics = DEFAULT_METRICS.map((d) => ({ ...d }));
+  if (!cfg.metricCache.length) cfg.metricCache = DEFAULT_METRICS.map((d) => ({ ...d }));
+  if (!cfg.enabledSources || !cfg.enabledSources.length) cfg.enabledSources = ["apm"];
+  // 配置迁移：补充新增 APM 指标并统一顺序
+  for (const d of DEFAULT_METRICS) {
+    if (!cfg.metricCache.some((m) => m.name === d.name)) cfg.metricCache.push({ ...d });
+    if (!cfg.selectedMetrics.some((m) => m.name === d.name && m.view === d.view)) cfg.selectedMetrics.push({ ...d });
+  }
+  // 补充已启用数据源新增的数据库指标（如 Redis 健康得分）
+  for (const t of ["mysql", "redis", "mongodb"]) {
+    if (!isEnabled(t)) continue;
+    for (const d of DB_METRICS[t]) {
+      if (!cfg.selectedMetrics.some((m) => m.name === d.name && m.view === t)) {
+        cfg.selectedMetrics.push({ ...d, view: t });
+      }
+    }
+  }
+  const order = new Map(DEFAULT_METRICS.map((d, i) => [d.name + "|" + d.view, i]));
+  const sortByDefault = (arr) =>
+    [...new Map(arr.map((m) => [m.name + "|" + m.view, m])).values()].sort(
+      (a, b) => (order.has(a.name + "|" + a.view) ? order.get(a.name + "|" + a.view) : 99) -
+                (order.has(b.name + "|" + b.view) ? order.get(b.name + "|" + b.view) : 99)
+    );
+  cfg.selectedMetrics = sortByDefault(cfg.selectedMetrics);
+  cfg.metricCache = sortByDefault(cfg.metricCache);
+
+  $("region").value = cfg.region || "ap-shanghai";
+  $("region-id").value = cfg.regionId ?? 4;
+  $("instance-id").value = cfg.instanceId || "";
+  $("secret-id").value = cfg.secretId || "";
+  $("secret-key").value = cfg.secretKey || "";
+  $("cookie").value = cfg.cookie || "";
+  $("uin").value = cfg.uin || "";
+  $("owner-uin").value = cfg.ownerUin || "";
+  $("csrf-code").value = cfg.csrfCode || "";
+  document.querySelector(`input[name="auth"][value="${cfg.authMode === "cookie" ? "cookie" : "secret"}"]`).checked = true;
+  $("auth-secret").classList.toggle("hidden", cfg.authMode === "cookie");
+  $("auth-cookie").classList.toggle("hidden", cfg.authMode !== "cookie");
+  if (cfg.useCustom && cfg.customStart) $("custom-start").value = cfg.customStart;
+  if (cfg.useCustom && cfg.customEnd) $("custom-end").value = cfg.customEnd;
+  $("settings").open = !(cfg.cookie || cfg.secretId);
+  $("field-team").classList.toggle("hidden", !isEnabled("apm"));
+  updateSettingsHint();
+
+  bindConfigInputs();
+  renderSourceChips();
+  renderTimeUI();
+  activeListTab = cfg.enabledSources.find(isEnabled) || "apm";
+  activeMetricTab = activeListTab;
+  renderTabs();
+  renderApps(false);
+  renderMetrics();
+
+  // 入场动画
+  animate(".anim-enter", {
+    translateY: [18, 0],
+    opacity: [0, 1],
+    delay: stagger(90),
+    duration: 550,
+    ease: "outExpo",
+  });
+
+  // 配置齐全时自动加载所有已启用数据源的列表
+  if (cfg.secretId || cfg.cookie) {
+    loadSources(cfg.enabledSources.filter(isEnabled));
+  }
+}
+
+init().catch(showErr);

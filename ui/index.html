@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>APM 监控</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header id="topbar" class="anim-enter">
+    <div class="brand"><span class="brand-dot"></span>APM 监控</div>
+    <span id="status"></span>
+    <div class="spacer"></div>
+    <button id="btn-query" class="btn-primary btn-big">
+      <span class="btn-label">开始统计</span>
+    </button>
+  </header>
+
+  <details id="settings" class="card anim-enter">
+    <summary><span class="card-title">设置</span><span class="muted" id="settings-hint"></span></summary>
+    <div class="grid">
+      <label class="field">地域
+        <select id="region"></select>
+      </label>
+      <label class="field" id="field-team">业务系统 ID (team)
+        <input id="instance-id" placeholder="apm-tHxaVZjHH" />
+      </label>
+      <label class="field">regionId (Cookie 模式用)
+        <input id="region-id" type="number" style="width:100px" />
+      </label>
+      <div class="auth-block">
+        <div class="radio-row">
+          <label class="chip-radio"><input type="radio" name="auth" value="secret" /><span>密钥模式</span></label>
+          <label class="chip-radio"><input type="radio" name="auth" value="cookie" /><span>Cookie 模式</span></label>
+        </div>
+        <div id="auth-secret">
+          <div class="row">
+            <input id="secret-id" placeholder="SecretId" autocomplete="off" style="min-width:280px" />
+            <input id="secret-key" type="password" placeholder="SecretKey" autocomplete="off" style="min-width:280px" />
+          </div>
+        </div>
+        <div id="auth-cookie" class="hidden">
+          <div class="row">
+            <textarea id="curl-paste" rows="3" style="flex:1" placeholder="在浏览器 F12 → 网络 → 找到 _api/apm/ 开头的请求 → 右键「复制」→「复制为 cURL」，整段粘贴到此处，点「解析并填充」"></textarea>
+          </div>
+          <div class="row">
+            <button id="btn-parse-curl" class="btn-primary">解析并填充</button>
+            <span id="curl-result" class="muted"></span>
+          </div>
+          <div class="row">
+            <input id="uin" placeholder="uin（自动解析，可改）" style="width:130px" />
+            <input id="owner-uin" placeholder="ownerUin（自动解析，可改）" style="width:170px" />
+            <input id="csrf-code" placeholder="csrfCode（自动解析，可改）" style="width:180px" />
+          </div>
+          <div class="row">
+            <textarea id="cookie" rows="2" style="flex:1" placeholder="Cookie 整串（解析 curl 后自动填充，也可手动粘贴）"></textarea>
+          </div>
+          <div class="row">
+            <button id="btn-validate-cookie" class="btn-ghost">校验 Cookie</button>
+            <span id="cookie-result"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <section id="time-section" class="card anim-enter">
+    <div class="card-title">监控对象 <span class="muted">（可同时勾选多个数据源）</span></div>
+    <div id="source-chips" class="chips"></div>
+  </section>
+
+  <section id="time-section2" class="card anim-enter">
+    <div class="card-title">统计时间</div>
+    <div id="quick-ranges" class="chips"></div>
+    <div id="custom-range" class="row hidden">
+      <label class="field">开始 <input type="datetime-local" id="custom-start" step="60" /></label>
+      <label class="field">结束 <input type="datetime-local" id="custom-end" step="60" /></label>
+    </div>
+    <div id="range-hint" class="muted"></div>
+  </section>
+
+  <div id="main-cols">
+    <section id="apps-section" class="card anim-enter">
+      <div class="tabs" id="list-tabs"></div>
+      <div class="row">
+        <button id="btn-load-apps" class="btn-ghost">加载列表</button>
+        <input id="app-search" placeholder="搜索过滤…" style="flex:1" />
+      </div>
+      <div class="row">
+        <button class="btn-mini" id="btn-app-all">全选</button>
+        <button class="btn-mini" id="btn-app-none">清空</button>
+        <span class="muted">当前页签已选 <b id="selected-app-count">0</b> 个</span>
+      </div>
+      <div id="app-list" class="check-list"></div>
+    </section>
+
+    <section id="metrics-section" class="card anim-enter">
+      <div class="tabs" id="metric-tabs"></div>
+      <div class="row">
+        <button id="btn-refresh-metrics" class="btn-ghost">刷新指标清单</button>
+        <button class="btn-mini" id="btn-metrics-default">恢复默认勾选</button>
+      </div>
+      <div id="metric-list" class="check-list"></div>
+    </section>
+  </div>
+
+  <div id="action-bar" class="anim-enter">
+    <button id="btn-query-2" class="btn-primary btn-big" style="padding: 11px 64px; font-size: 16px">开始统计</button>
+  </div>
+
+  <section id="results-section" class="card anim-enter">
+    <div class="row" style="justify-content: space-between">
+      <div class="card-title">统计结果</div>
+      <button class="btn-mini" id="btn-copy-all">复制全部</button>
+    </div>
+    <div id="results">
+      <div id="empty-hint" class="muted" style="padding:24px; text-align:center">
+        选好应用和指标后，点右上角「开始统计」
+      </div>
+    </div>
+  </section>
+
+  <script src="vendor/anime.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "apm-monitor",
+  "version": "0.1.0",
+  "identifier": "com.local.apmmonitor",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "APM 监控",
+        "width": 1280,
+        "height": 900
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.ico"]
+  }
+}
