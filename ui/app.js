@@ -110,8 +110,8 @@ const DB_METRICS = {
     { name: "mem", cn: "内存百分比", unit: "%" },
     { name: "mem_max", cn: "最大内存百分比", unit: "%" },
     { name: "disk", cn: "磁盘使用百分比", unit: "%", noPrefix: true },
-    { name: "mongos_cpu_avg", cn: "Mongos平均CPU使用率", unit: "%" },
-    { name: "mongos_cpu_max", cn: "Mongos最大CPU使用率", unit: "%" },
+    { name: "mongos_cpu_avg", cn: "Mongos平均CPU使用率", unit: "%", hideIfEmpty: true },
+    { name: "mongos_cpu_max", cn: "Mongos最大CPU使用率", unit: "%", hideIfEmpty: true },
   ],
 };
 // 默认勾选（核心指标），其余可在指标面板自行勾选
@@ -697,6 +697,8 @@ function dbLines(app, range, src) {
     if (!has(d.name)) continue;
     if (src === "mysql" && (d.name === "conn" || d.name === "conn_limit")) continue; // 已在上面合并输出
     const val = v(d.name);
+    // 标记 hideIfEmpty 的指标（如副本集无 Mongos）在无数据时整行不输出
+    if (d.hideIfEmpty && val === undefined) continue;
     lines.push(`${d.noPrefix ? "" : p}${d.cn}：${fmtDb(d, val)}`);
   }
   if (app.error) lines.push(`（查询出错：${app.error}）`);
