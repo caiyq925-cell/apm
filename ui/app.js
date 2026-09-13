@@ -430,6 +430,13 @@ function toggleSelected(t, name, checked) {
   scheduleSave();
 }
 
+function setAppFilter(selectedOnly) {
+  appFilterSelectedOnly = selectedOnly;
+  $("btn-app-filter-all").classList.toggle("active", !selectedOnly);
+  $("btn-app-selected").classList.toggle("active", selectedOnly);
+  renderApps(false);
+}
+
 function renderApps(animateIn) {
   const t = activeListTab;
   if (!isEnabled(t)) {
@@ -942,11 +949,8 @@ function bindConfigInputs() {
     renderListTabs();
     scheduleSave();
   };
-  $("btn-app-selected").onclick = () => {
-    appFilterSelectedOnly = !appFilterSelectedOnly;
-    $("btn-app-selected").classList.toggle("active", appFilterSelectedOnly);
-    renderApps(false);
-  };
+  $("btn-app-filter-all").onclick = () => setAppFilter(false);
+  $("btn-app-selected").onclick = () => setAppFilter(true);
   $("btn-refresh-metrics").onclick = refreshMetrics;
   $("btn-metrics-default").onclick = () => {
     cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !["service_metric", "computed"].includes(m.view));
