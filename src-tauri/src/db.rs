@@ -1,9 +1,6 @@
 // 数据库监控（MySQL / Redis / MongoDB）
-// 指标来源：云监控 GetMonitorData（命名空间经实测/文档确认）+ DBbrain 空间接口（磁盘）
-// 实测确认的口径：
-//   MySQL   QCE/CDB     CpuUseRate/MemoryUse/QPS/ThreadsConnected/MaxConnections（维度 InstanceId）
-//   Redis   QCE/REDIS_MEM CpuUtil/MemUtil/ConnectionsUtil/CmdHitsRatio（维度 instanceid，全小写）
-//   MongoDB QCE/CMONGO   CpuUsage/MemUsage/DiskUsage（维度 InstanceId；若报维度错误需按控制台抓包校准）
+// 指标来源：云监控 GetMonitorData + DBbrain（磁盘/健康得分）
+// 所有指标名均经控制台接口对真实实例实测确认
 use crate::apm::Channel;
 use serde_json::{json, Value};
 
@@ -55,7 +52,77 @@ pub async fn list_db_instances(ch: &Channel, db_type: &str) -> Result<Vec<DbInst
     Ok(out)
 }
 
-/// 拉一条监控指标时间序列，返回 (最大值, 平均值)
+// ---------- 指标目录 ----------
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Stat {
+    Max,
+    Avg,
+}
+
+pub struct CatalogEntry {
+    pub key: &'static str,
+    pub ns: &'static str,
+    pub metric: &'static str,
+    pub stat: Stat,
+}
+
+pub fn catalog(db_type: &str) -> &'static [CatalogEntry] {
+    const CDB: &str = "QCE/CDB";
+    const RDS: &str = "QCE/REDIS_MEM";
+    const MGO: &str = "QCE/CMONGO";
+    match db_type {
+        "mysql" => &[
+            CatalogEntry { key: "cpu", ns: CDB, metric: "CpuUseRate", stat: Stat::Max },
+            CatalogEntry { key: "mem", ns: CDB, metric: "MemoryUseRate", stat: Stat::Max },
+            CatalogEntry { key: "qps", ns: CDB, metric: "QPS", stat: Stat::Max },
+            CatalogEntry { key: "tps", ns: CDB, metric: "TPS", stat: Stat::Max },
+            CatalogEntry { key: "conn", ns: CDB, metric: "ThreadsConnected", stat: Stat::Max },
+            CatalogEntry { key: "conn_limit", ns: CDB, metric: "MaxConnections", stat: Stat::Max },
+            CatalogEntry { key: "conn_rate", ns: CDB, metric: "ConnectionUseRate", stat: Stat::Max },
+            CatalogEntry { key: "threads_running", ns: CDB, metric: "ThreadsRunning", stat: Stat::Max },
+            CatalogEntry { key: "slow", ns: CDB, metric: "SlowQueries", stat: Stat::Max },
+            CatalogEntry { key: "innodb_hit", ns: CDB, metric: "InnodbCacheHitRate", stat: Stat::Avg },
+            CatalogEntry { key: "commit", ns: CDB, metric: "ComCommit", stat: Stat::Max },
+            CatalogEntry { key: "rollback", ns: CDB, metric: "ComRollback", stat: Stat::Max },
+        ],
+        "redis" => &[
+            CatalogEntry { key: "cpu", ns: RDS, metric: "CpuUtil", stat: Stat::Max },
+            CatalogEntry { key: "cpu_max", ns: RDS, metric: "CpuMaxUtil", stat: Stat::Max },
+            CatalogEntry { key: "mem", ns: RDS, metric: "MemUtil", stat: Stat::Max },
+            CatalogEntry { key: "mem_max", ns: RDS, metric: "MemMaxUtil", stat: Stat::Max },
+            CatalogEntry { key: "conn_util", ns: RDS, metric: "ConnectionsUtil", stat: Stat::Max },
+            CatalogEntry { key: "conn_max_util", ns: RDS, metric: "ConnectionsMaxUtil", stat: Stat::Max },
+            CatalogEntry { key: "hit", ns: RDS, metric: "CmdHitsRatio", stat: Stat::Avg },
+            CatalogEntry { key: "qps", ns: RDS, metric: "Commands", stat: Stat::Max },
+            CatalogEntry { key: "conn", ns: RDS, metric: "Connections", stat: Stat::Max },
+            CatalogEntry { key: "mem_used", ns: RDS, metric: "MemUsed", stat: Stat::Max },
+            CatalogEntry { key: "keys", ns: RDS, metric: "Keys", stat: Stat::Max },
+            CatalogEntry { key: "cmd_err", ns: RDS, metric: "CmdErr", stat: Stat::Max },
+            CatalogEntry { key: "evicted", ns: RDS, metric: "Evicted", stat: Stat::Max },
+            CatalogEntry { key: "expired", ns: RDS, metric: "Expired", stat: Stat::Max },
+            CatalogEntry { key: "slow", ns: RDS, metric: "CmdSlow", stat: Stat::Max },
+            CatalogEntry { key: "latency_avg", ns: RDS, metric: "LatencyAvg", stat: Stat::Max },
+            CatalogEntry { key: "latency_max", ns: RDS, metric: "LatencyMax", stat: Stat::Max },
+            CatalogEntry { key: "latency_p99", ns: RDS, metric: "LatencyP99", stat: Stat::Max },
+            CatalogEntry { key: "flow_in", ns: RDS, metric: "InFlow", stat: Stat::Max },
+            CatalogEntry { key: "flow_out", ns: RDS, metric: "OutFlow", stat: Stat::Max },
+        ],
+        "mongodb" => &[
+            CatalogEntry { key: "cpu", ns: MGO, metric: "MonogdMaxCpuUsage", stat: Stat::Max },
+            CatalogEntry { key: "cpu_avg", ns: MGO, metric: "MonogdAvgCpuUsage", stat: Stat::Avg },
+            CatalogEntry { key: "mem", ns: MGO, metric: "MongodAvgMemUsage", stat: Stat::Avg },
+            CatalogEntry { key: "mem_max", ns: MGO, metric: "MongodMaxMemUsage", stat: Stat::Max },
+            CatalogEntry { key: "disk", ns: MGO, metric: "ClusterDiskusage", stat: Stat::Max },
+            CatalogEntry { key: "mongos_cpu_avg", ns: MGO, metric: "MonogsAvgCpuUsage", stat: Stat::Avg },
+            CatalogEntry { key: "mongos_cpu_max", ns: MGO, metric: "MonogsMaxCpuUsage", stat: Stat::Max },
+        ],
+        _ => &[],
+    }
+}
+
+// ---------- 查询 ----------
+
 async fn monitor_series(
     ch: &Channel,
     ns: &str,
@@ -111,24 +178,40 @@ pub struct DbMetricValue {
     pub value: f64,
 }
 
+fn push(out: &mut Vec<DbMetricValue>, name: &str, v: Option<f64>) {
+    if let Some(v) = v {
+        out.push(DbMetricValue { name: name.to_string(), value: v });
+    }
+}
+
 pub async fn query_db_metrics(
     ch: &Channel,
     db_type: &str,
     instance_id: &str,
     start: i64,
     end: i64,
+    metrics: &[String],
 ) -> Result<Vec<DbMetricValue>, String> {
     let dims = dims_for(db_type, instance_id);
+    let want = |key: &str| metrics.iter().any(|m| m == key);
     let mut out: Vec<DbMetricValue> = Vec::new();
 
+    // 云监控指标
+    for entry in catalog(db_type) {
+        if !want(entry.key) {
+            continue;
+        }
+        let (max, avg) = monitor_series(ch, entry.ns, entry.metric, &dims, start, end).await?;
+        let v = match entry.stat {
+            Stat::Max => max,
+            Stat::Avg => avg,
+        };
+        push(&mut out, entry.key, v);
+    }
+
+    // DBbrain 特殊指标（磁盘 / 健康得分）
     match db_type {
-        "mysql" => {
-            let (cpu, _) = monitor_series(ch, "QCE/CDB", "CpuUseRate", &dims, start, end).await?;
-            let (mem, _) = monitor_series(ch, "QCE/CDB", "MemoryUseRate", &dims, start, end).await?;
-            let (qps, _) = monitor_series(ch, "QCE/CDB", "QPS", &dims, start, end).await?;
-            let (conn, _) = monitor_series(ch, "QCE/CDB", "ThreadsConnected", &dims, start, end).await?;
-            let (conn_limit, _) = monitor_series(ch, "QCE/CDB", "MaxConnections", &dims, start, end).await?;
-            // 磁盘使用率：DBbrain 空间概览 (Total-Remain)/Total
+        "mysql" if want("disk") => {
             let payload = json!({ "Version": "2019-10-16", "Product": "mysql", "InstanceId": instance_id });
             let resp = ch.call_service("dbbrain", "2019-10-16", "DescribeDBSpaceStatus", &payload).await?;
             let total = resp["Total"].as_f64();
@@ -137,54 +220,20 @@ pub async fn query_db_metrics(
                 (Some(t), Some(r)) if t > 0.0 => Some((t - r) / t * 100.0),
                 _ => None,
             };
-            push(&mut out, "cpu", cpu);
-            push(&mut out, "mem", mem);
-            push(&mut out, "qps", qps);
-            push(&mut out, "conn", conn);
-            push(&mut out, "conn_limit", conn_limit);
             push(&mut out, "disk", disk);
         }
-        "redis" => {
-            // 健康得分：DBbrain DescribeHealthScore（Time 必填）
-            let payload = json!({ "Version": "2019-10-16", "Product": "redis", "InstanceId": instance_id, "Time": iso_local(end) });
+        "redis" | "mongodb" if want("score") => {
+            let payload = json!({
+                "Version": "2019-10-16",
+                "Product": db_type,
+                "InstanceId": instance_id,
+                "Time": iso_local(end)
+            });
             let resp = ch.call_service("dbbrain", "2019-10-16", "DescribeHealthScore", &payload).await?;
-            let score = resp["Data"]["Value"].as_f64();
-            push(&mut out, "score", score);
-
-            let (cpu, _) = monitor_series(ch, "QCE/REDIS_MEM", "CpuUtil", &dims, start, end).await?;
-            let (mem, _) = monitor_series(ch, "QCE/REDIS_MEM", "MemUtil", &dims, start, end).await?;
-            let (conn_util, _) = monitor_series(ch, "QCE/REDIS_MEM", "ConnectionsUtil", &dims, start, end).await?;
-            let (_, hit_avg) = monitor_series(ch, "QCE/REDIS_MEM", "CmdHitsRatio", &dims, start, end).await?;
-            push(&mut out, "cpu", cpu);
-            push(&mut out, "mem", mem);
-            push(&mut out, "conn_util", conn_util);
-            push(&mut out, "hit", hit_avg);
+            push(&mut out, "score", resp["Data"]["Value"].as_f64());
         }
-        "mongodb" => {
-            // 健康得分：DBbrain DescribeHealthScore（Time 必填）
-            let payload = json!({ "Version": "2019-10-16", "Product": "mongodb", "InstanceId": instance_id, "Time": iso_local(end) });
-            let resp = ch.call_service("dbbrain", "2019-10-16", "DescribeHealthScore", &payload).await?;
-            let score = resp["Data"]["Value"].as_f64();
-            push(&mut out, "score", score);
-
-            // 实测：维度名为全小写 target；CPU/内存用 mongod 节点聚合指标，磁盘用整实例容量使用率
-            let (cpu, _) = monitor_series(ch, "QCE/CMONGO", "MonogdMaxCpuUsage", &dims, start, end).await?;
-            let (_, mem_avg) = monitor_series(ch, "QCE/CMONGO", "MongodAvgMemUsage", &dims, start, end).await?;
-            let (disk, _) = monitor_series(ch, "QCE/CMONGO", "ClusterDiskusage", &dims, start, end).await?;
-            push(&mut out, "cpu", cpu);
-            push(&mut out, "mem", mem_avg);
-            push(&mut out, "disk", disk);
-        }
-        _ => return Err(format!("不支持的数据库类型: {}", db_type)),
+        _ => {}
     }
+
     Ok(out)
 }
-
-fn push(out: &mut Vec<DbMetricValue>, name: &str, v: Option<f64>) {
-    if let Some(v) = v {
-        out.push(DbMetricValue { name: name.to_string(), value: v });
-    }
-}
-
-#[allow(dead_code)]
-fn unused(_: Value) {}

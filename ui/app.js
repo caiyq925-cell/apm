@@ -50,27 +50,62 @@ const DEFAULT_METRICS = [
 const SOURCE_ORDER = ["apm", "mysql", "redis", "mongodb"];
 const SOURCE_NAMES = { apm: "APM 应用", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
 const DB_TITLES = { mysql: "MySQL 实例", redis: "Redis 实例", mongodb: "MongoDB 实例" };
+// 数据库指标目录（全部经真实实例实测可用）
 const DB_METRICS = {
   mysql: [
-    { name: "cpu", cn: "CPU最高点" },
-    { name: "mem", cn: "内存最高点" },
-    { name: "qps", cn: "峰值QPS" },
-    { name: "conn", cn: "最高连接数" },
-    { name: "disk", cn: "磁盘使用率" },
+    { name: "cpu", cn: "CPU最高点", unit: "%" },
+    { name: "mem", cn: "内存最高点", unit: "%" },
+    { name: "qps", cn: "峰值QPS", unit: "次/秒" },
+    { name: "tps", cn: "峰值TPS", unit: "次/秒" },
+    { name: "conn", cn: "最高连接数", unit: "个" },
+    { name: "conn_limit", cn: "连接数上限", unit: "个" },
+    { name: "conn_rate", cn: "连接使用率", unit: "%" },
+    { name: "threads_running", cn: "活跃线程数", unit: "个" },
+    { name: "slow", cn: "慢查询数", unit: "次" },
+    { name: "innodb_hit", cn: "InnoDB缓存命中率", unit: "%" },
+    { name: "commit", cn: "提交数", unit: "次" },
+    { name: "rollback", cn: "回滚数", unit: "次" },
+    { name: "disk", cn: "磁盘使用率", unit: "%", noPrefix: true },
   ],
   redis: [
-    { name: "score", cn: "健康得分" },
-    { name: "cpu", cn: "CPU使用率" },
-    { name: "mem", cn: "内存使用率" },
-    { name: "conn_util", cn: "连接使用率" },
-    { name: "hit", cn: "读请求命中率" },
+    { name: "score", cn: "健康得分", unit: "分", noPrefix: true },
+    { name: "cpu", cn: "CPU使用率", unit: "%" },
+    { name: "cpu_max", cn: "节点最大CPU使用率", unit: "%" },
+    { name: "mem", cn: "内存使用率", unit: "%" },
+    { name: "mem_max", cn: "节点最大内存使用率", unit: "%" },
+    { name: "conn_util", cn: "连接使用率", unit: "%" },
+    { name: "conn_max_util", cn: "节点最大连接使用率", unit: "%" },
+    { name: "hit", cn: "读请求命中率", unit: "%" },
+    { name: "qps", cn: "峰值QPS", unit: "次/秒" },
+    { name: "conn", cn: "连接数", unit: "个" },
+    { name: "mem_used", cn: "内存使用量", unit: "MB" },
+    { name: "keys", cn: "Key总数", unit: "个" },
+    { name: "cmd_err", cn: "执行错误数", unit: "次" },
+    { name: "evicted", cn: "Key驱逐数", unit: "个" },
+    { name: "expired", cn: "Key过期数", unit: "个" },
+    { name: "slow", cn: "慢查询数", unit: "次" },
+    { name: "latency_avg", cn: "平均执行时延", unit: "ms" },
+    { name: "latency_max", cn: "最大执行时延", unit: "ms" },
+    { name: "latency_p99", cn: "P99执行时延", unit: "ms" },
+    { name: "flow_in", cn: "入流量", unit: "MB/s" },
+    { name: "flow_out", cn: "出流量", unit: "MB/s" },
   ],
   mongodb: [
-    { name: "score", cn: "健康得分" },
-    { name: "cpu", cn: "最大CPU使用率" },
-    { name: "mem", cn: "内存百分比" },
-    { name: "disk", cn: "磁盘使用百分比" },
+    { name: "score", cn: "健康得分", unit: "分", noPrefix: true },
+    { name: "cpu", cn: "最大CPU使用率", unit: "%" },
+    { name: "cpu_avg", cn: "平均CPU使用率", unit: "%" },
+    { name: "mem", cn: "内存百分比", unit: "%" },
+    { name: "mem_max", cn: "最大内存百分比", unit: "%" },
+    { name: "disk", cn: "磁盘使用百分比", unit: "%", noPrefix: true },
+    { name: "mongos_cpu_avg", cn: "Mongos平均CPU使用率", unit: "%" },
+    { name: "mongos_cpu_max", cn: "Mongos最大CPU使用率", unit: "%" },
   ],
+};
+// 默认勾选（核心指标），其余可在指标面板自行勾选
+const DB_DEFAULT_SELECTED = {
+  mysql: ["cpu", "mem", "qps", "conn", "disk"],
+  redis: ["score", "cpu", "mem", "conn_util", "hit"],
+  mongodb: ["score", "cpu", "mem", "disk"],
 };
 
 let cfg = null;
@@ -146,7 +181,12 @@ function renderSourceChips() {
       } else {
         cfg.enabledSources.push(t);
         if (t !== "apm" && !(cfg.selectedMetrics || []).some((m) => m.view === t)) {
-          cfg.selectedMetrics.push(...DB_METRICS[t].map((d) => ({ ...d, view: t })));
+          cfg.selectedMetrics.push(
+            ...(DB_DEFAULT_SELECTED[t] || []).map((name) => {
+              const def = DB_METRICS[t].find((d) => d.name === name);
+              return { ...def, view: t };
+            })
+          );
         }
       }
       renderSourceChips();
@@ -434,12 +474,13 @@ async function query() {
     if (!cfg.selectedMetrics.some((m) => m.view === t)) return showErr(`${SOURCE_NAMES[t]} 已启用，请先勾选指标`);
     tasks.push(
       invoke("query_db_metrics", {
-        config: cfg,
-        dbType: t,
-        startTs: r.start,
-        endTs: r.end,
-        instances,
-      }).then((results) => ({ src: t, results }))
+          config: cfg,
+          dbType: t,
+          startTs: r.start,
+          endTs: r.end,
+          instances,
+          metrics: cfg.selectedMetrics.filter((m) => m.view === t).map((m) => m.name),
+        }).then((results) => ({ src: t, results }))
     );
   }
   if (!tasks.length) return showErr("请先启用数据源并选择对象");
@@ -477,45 +518,39 @@ function dbLines(app, range, src) {
     return x ? x.value : undefined;
   };
   const pct = (x) => (x === undefined ? "-" : `${Math.round(x * 10) / 10}%`);
+  const fmtDb = (d, x) => {
+    if (x === undefined) return "-";
+    switch (d.unit) {
+      case "%": return pct(x);
+      case "分": return `${Math.round(x)} 分`;
+      case "ms": return `${Math.round(x * 10) / 10} ms`;
+      case "次/秒": case "MB/s": return `${Math.round(x * 10) / 10} ${d.unit}`;
+      default: return `${fmtCount(x)} ${d.unit}`;
+    }
+  };
   const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === src);
   const p = range.dbPrefix;
+  const defs = DB_METRICS[src];
   const lines = [`**${app.name}**`, `统计窗口：${range.label}`];
-  if (src === "mysql") {
-    if (has("cpu")) lines.push(`${p}CPU最高点：${pct(v("cpu"))}`);
-    if (has("mem")) lines.push(`${p}内存最高点：${pct(v("mem"))}`);
-    if (has("qps")) {
-      const q = v("qps");
-      lines.push(`${p}峰值QPS：${q !== undefined ? `${fmtCount(q)} 次/秒` : "-"}`);
-    }
-    if (has("conn")) {
-      const c = v("conn");
-      const cl = v("conn_limit");
-      const txt =
-        c === undefined
-          ? "-"
-          : cl !== undefined
-            ? `${fmtCount(c)}/${fmtCount(cl)} 个`
-            : `${fmtCount(c)} 个`;
-      lines.push(`${p}最高连接数：${txt}`);
-    }
-    if (has("disk")) lines.push(`磁盘使用率：${pct(v("disk"))}`);
-  } else if (src === "redis") {
-    if (has("score")) {
-      const s = v("score");
-      lines.push(`健康得分：${s !== undefined ? `${Math.round(s)} 分` : "-"}`);
-    }
-    if (has("cpu")) lines.push(`${p}CPU使用率：${pct(v("cpu"))}`);
-    if (has("mem")) lines.push(`${p}内存使用率：${pct(v("mem"))}`);
-    if (has("conn_util")) lines.push(`${p}连接使用率：${pct(v("conn_util"))}`);
-    if (has("hit")) lines.push(`${p}读请求命中率：${pct(v("hit"))}`);
-  } else if (src === "mongodb") {
-    if (has("score")) {
-      const s = v("score");
-      lines.push(`健康得分：${s !== undefined ? `${Math.round(s)} 分` : "-"}`);
-    }
-    if (has("cpu")) lines.push(`${p}最大CPU使用率：${pct(v("cpu"))}`);
-    if (has("mem")) lines.push(`${p}内存百分比：${pct(v("mem"))}`);
-    if (has("disk")) lines.push(`磁盘使用百分比：${pct(v("disk"))}`);
+
+  // MySQL 连接数特殊格式：当前/上限
+  if (src === "mysql" && has("conn")) {
+    const c = v("conn");
+    const cl = v("conn_limit");
+    const txt =
+      c === undefined
+        ? "-"
+        : cl !== undefined
+          ? `${fmtCount(c)}/${fmtCount(cl)} 个`
+          : `${fmtCount(c)} 个`;
+    lines.push(`${p}最高连接数：${txt}`);
+  }
+
+  for (const d of defs) {
+    if (!has(d.name)) continue;
+    if (src === "mysql" && (d.name === "conn" || d.name === "conn_limit")) continue; // 已在上面合并输出
+    const val = v(d.name);
+    lines.push(`${d.noPrefix ? "" : p}${d.cn}：${fmtDb(d, val)}`);
   }
   if (app.error) lines.push(`（查询出错：${app.error}）`);
   return lines;
@@ -829,12 +864,13 @@ async function init() {
     if (!cfg.metricCache.some((m) => m.name === d.name)) cfg.metricCache.push({ ...d });
     if (!cfg.selectedMetrics.some((m) => m.name === d.name && m.view === d.view)) cfg.selectedMetrics.push({ ...d });
   }
-  // 补充已启用数据源新增的数据库指标（如 Redis 健康得分）
+  // 补充已启用数据源默认勾选的核心数据库指标（新增指标不再自动全选，由用户自行勾选）
   for (const t of ["mysql", "redis", "mongodb"]) {
     if (!isEnabled(t)) continue;
-    for (const d of DB_METRICS[t]) {
-      if (!cfg.selectedMetrics.some((m) => m.name === d.name && m.view === t)) {
-        cfg.selectedMetrics.push({ ...d, view: t });
+    for (const name of DB_DEFAULT_SELECTED[t] || []) {
+      const def = (DB_METRICS[t] || []).find((d) => d.name === name);
+      if (def && !cfg.selectedMetrics.some((m) => m.name === name && m.view === t)) {
+        cfg.selectedMetrics.push({ ...def, view: t });
       }
     }
   }

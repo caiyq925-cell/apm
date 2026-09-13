@@ -171,9 +171,13 @@ pub async fn query_db_metrics(
     start_ts: i64,
     end_ts: i64,
     instances: Vec<String>,
+    metrics: Vec<String>,
 ) -> Result<Vec<AppMetrics>, String> {
     if instances.is_empty() {
         return Err("未选择数据库实例".into());
+    }
+    if metrics.is_empty() {
+        return Err("未选择指标".into());
     }
     let ch = Arc::new(Channel::from_config(&config)?);
     // 实例 ID -> 实例名（展示用）
@@ -192,8 +196,9 @@ pub async fn query_db_metrics(
         let ch = ch.clone();
         let id = id.clone();
         let db_type = db_type.clone();
+        let metrics = metrics.clone();
         join.spawn(async move {
-            let r = crate::db::query_db_metrics(&ch, &db_type, &id, start_ts, end_ts).await;
+            let r = crate::db::query_db_metrics(&ch, &db_type, &id, start_ts, end_ts, &metrics).await;
             drop(permit);
             (id, r)
         });
