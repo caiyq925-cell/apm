@@ -46,6 +46,19 @@ const DEFAULT_METRICS = [
   { name: "duration_max", view: "service_metric", cn: "最大耗时" },
 ];
 
+// APM 扩展视图指标（SQL 调用 / MQ / JVM，全部实测可用；默认不勾选）
+const APM_VIEW_METRICS = [
+  { name: "request_count", view: "sql_metric", cn: "SQL请求数" },
+  { name: "error_request_count", view: "sql_metric", cn: "SQL错误数" },
+  { name: "duration_avg", view: "sql_metric", cn: "SQL平均响应时间" },
+  { name: "request_count", view: "mq_metric", cn: "MQ请求数" },
+  { name: "error_request_count", view: "mq_metric", cn: "MQ错误数" },
+  { name: "duration_avg", view: "mq_metric", cn: "MQ平均响应时间" },
+  { name: "jvm_memory_used", view: "runtime_metric", cn: "JVM已用内存" },
+  { name: "jvm_memory_max", view: "runtime_metric", cn: "JVM最大内存" },
+  { name: "jvm_gc_count", view: "runtime_metric", cn: "GC次数" },
+];
+
 // 数据源
 const SOURCE_ORDER = ["apm", "mysql", "redis", "mongodb"];
 const SOURCE_NAMES = { apm: "APM 应用", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
@@ -494,6 +507,9 @@ function renderMetrics() {
     const defs = cfg.metricCache.length ? cfg.metricCache : DEFAULT_METRICS;
     addGroup("应用指标", defs.filter((d) => d.view === "service_metric"));
     addGroup("计算指标", defs.filter((d) => d.view === "computed"));
+    addGroup("SQL 调用", defs.filter((d) => d.view === "sql_metric"));
+    addGroup("MQ 消息", defs.filter((d) => d.view === "mq_metric"));
+    addGroup("JVM 运行时", defs.filter((d) => d.view === "runtime_metric"));
   } else {
     addGroup(SOURCE_NAMES[t], DB_METRICS[t].map((d) => ({ ...d, view: t })));
   }
@@ -534,6 +550,7 @@ function fmtRate(v) {
 function fmtValue(name, v) {
   if (name.includes("rate")) return fmtRate(v);
   if (name.startsWith("duration")) return `${Math.round(v * 10) / 10} ms`;
+  if (name.startsWith("jvm_memory")) return `${fmtCount(v)} MB`;
   return fmtCount(v);
 }
 
@@ -969,6 +986,10 @@ async function init() {
   for (const d of DEFAULT_METRICS) {
     if (!cfg.metricCache.some((m) => m.name === d.name)) cfg.metricCache.push({ ...d });
     if (!cfg.selectedMetrics.some((m) => m.name === d.name && m.view === d.view)) cfg.selectedMetrics.push({ ...d });
+  }
+  // 扩展视图指标仅进缓存（默认不勾选，指标面板自行勾选）
+  for (const d of APM_VIEW_METRICS) {
+    if (!cfg.metricCache.some((m) => m.name === d.name && m.view === d.view)) cfg.metricCache.push({ ...d });
   }
   // 补充已启用数据源默认勾选的核心数据库指标（新增指标不再自动全选，由用户自行勾选）
   for (const t of ["mysql", "redis", "mongodb"]) {
