@@ -17,6 +17,16 @@ impl Default for MetricDef {
     }
 }
 
+/// 场景预设：一组 APM 应用 + 数据库实例 + 指标的快照
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Scenario {
+    pub name: String,
+    pub apps: Vec<String>,
+    pub db_instances: BTreeMap<String, Vec<String>>,
+    pub metrics: Vec<MetricDef>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
@@ -42,6 +52,9 @@ pub struct Config {
     pub metric_cache: Vec<MetricDef>,
     // 数据库类型 -> 已选实例 ID 列表
     pub selected_db_instances: BTreeMap<String, Vec<String>>,
+    // 场景预设与当前激活场景（空/"自定义" 表示手动模式）
+    pub scenarios: Vec<Scenario>,
+    pub active_scenario: String,
 }
 
 fn default_sources() -> Vec<String> {

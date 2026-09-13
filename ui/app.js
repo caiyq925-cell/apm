@@ -119,9 +119,111 @@ const isEnabled = (t) => (cfg.enabledSources || []).includes(t);
 const dbInstances = (t) => (cfg.selectedDbInstances && cfg.selectedDbInstances[t]) || [];
 
 // ---------- 配置持久化 ----------
+function snapshotSelection() {
+  return {
+    apps: [...cfg.selectedApps],
+    dbInstances: JSON.parse(JSON.stringify(cfg.selectedDbInstances || {})),
+    metrics: JSON.parse(JSON.stringify(cfg.selectedMetrics || [])),
+  };
+}
+
+function applySelection(snap) {
+  cfg.selectedApps = [...(snap.apps || [])];
+  cfg.selectedDbInstances = JSON.parse(JSON.stringify(snap.dbInstances || {}));
+  cfg.selectedMetrics = JSON.parse(JSON.stringify(snap.metrics || []));
+}
+
+// 激活场景时，界面上的一切勾选改动实时回写到场景
+function syncActiveScenario() {
+  if (!cfg.activeScenario || cfg.activeScenario === "自定义") return;
+  const s = (cfg.scenarios || []).find((x) => x.name === cfg.activeScenario);
+  if (!s) return;
+  const snap = snapshotSelection();
+  s.apps = snap.apps;
+  s.dbInstances = snap.dbInstances;
+  s.metrics = snap.metrics;
+}
+
 function scheduleSave() {
+  syncActiveScenario();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => invoke("save_config", { config: cfg }).catch(showErr), 400);
+}
+
+// ---------- 场景 ----------
+function renderScenarioChips() {
+  const box = $("scenario-chips");
+  box.innerHTML = "";
+  const active = cfg.activeScenario || "自定义";
+  const names = ["自定义", ...(cfg.scenarios || []).map((s) => s.name)];
+  for (const name of names) {
+    const chip = document.createElement("button");
+    chip.className = "chip" + (active === name ? " active" : "");
+    let label = name;
+    if (name !== "自定义") {
+      const s = cfg.scenarios.find((x) => x.name === name);
+      if (s) label += `（APM ${s.apps.length} · 库 ${(Object.values(s.dbInstances || {})).reduce((n, v) => n + v.length, 0)}）`;
+    }
+    chip.textContent = label;
+    chip.onclick = () => switchScenario(name);
+    box.appendChild(chip);
+  }
+  $("btn-scenario-delete").disabled = active === "自定义";
+}
+
+function switchScenario(name) {
+  if ((cfg.activeScenario || "自定义") === name) return;
+  // 把当前工作区写回原场景，避免丢失改动
+  if (cfg.activeScenario && cfg.activeScenario !== "自定义") {
+    const prev = (cfg.scenarios || []).find((x) => x.name === cfg.activeScenario);
+    if (prev) {
+      const snap = snapshotSelection();
+      prev.apps = snap.apps;
+      prev.dbInstances = snap.dbInstances;
+      prev.metrics = snap.metrics;
+    }
+  }
+  cfg.activeScenario = name === "自定义" ? "" : name;
+  const s = (cfg.scenarios || []).find((x) => x.name === name);
+  if (s) applySelection(s);
+  renderScenarioChips();
+  renderSourceChips();
+  renderTabs();
+  renderApps(false);
+  renderMetrics();
+  updateSettingsHint();
+  scheduleSave();
+}
+
+function saveScenario() {
+  let name = window.prompt("场景名称：", "");
+  name = (name || "").trim();
+  if (!name || name === "自定义") return;
+  if (!cfg.scenarios) cfg.scenarios = [];
+  const exist = cfg.scenarios.find((x) => x.name === name);
+  const snap = snapshotSelection();
+  if (exist) {
+    exist.apps = snap.apps;
+    exist.dbInstances = snap.dbInstances;
+    exist.metrics = snap.metrics;
+  } else {
+    cfg.scenarios.push({ name, apps: snap.apps, dbInstances: snap.dbInstances, metrics: snap.metrics });
+  }
+  cfg.activeScenario = name;
+  renderScenarioChips();
+  scheduleSave();
+  showOk(`场景「${name}」已保存${exist ? "（覆盖）" : ""}`);
+}
+
+function deleteScenario() {
+  const name = cfg.activeScenario;
+  if (!name || name === "自定义") return;
+  if (!window.confirm(`删除场景「${name}」？`)) return;
+  cfg.scenarios = cfg.scenarios.filter((x) => x.name !== name);
+  cfg.activeScenario = "";
+  renderScenarioChips();
+  scheduleSave();
+  showOk(`场景「${name}」已删除`);
 }
 
 function showErr(e) {
@@ -816,6 +918,8 @@ function bindConfigInputs() {
     if (all) { copyText(all, null); showOk("已复制全部"); }
   };
   $("btn-parse-curl").onclick = parseCurlFill;
+  $("btn-scenario-save").onclick = saveScenario;
+  $("btn-scenario-delete").onclick = deleteScenario;
   $("btn-validate-cookie").onclick = async () => {
     $("cookie-result").textContent = "校验中…";
     try {
@@ -859,6 +963,8 @@ async function init() {
   if (!cfg.selectedMetrics.length) cfg.selectedMetrics = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!cfg.metricCache.length) cfg.metricCache = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!cfg.enabledSources || !cfg.enabledSources.length) cfg.enabledSources = ["apm"];
+  if (!cfg.scenarios) cfg.scenarios = [];
+  if (!cfg.activeScenario) cfg.activeScenario = "";
   // 配置迁移：补充新增 APM 指标并统一顺序
   for (const d of DEFAULT_METRICS) {
     if (!cfg.metricCache.some((m) => m.name === d.name)) cfg.metricCache.push({ ...d });
@@ -902,6 +1008,7 @@ async function init() {
   updateSettingsHint();
 
   bindConfigInputs();
+  renderScenarioChips();
   renderSourceChips();
   renderTimeUI();
   activeListTab = cfg.enabledSources.find(isEnabled) || "apm";
