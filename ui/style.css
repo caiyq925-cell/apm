@@ -125,6 +125,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
   color: var(--text);
 }
 .btn-mini:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.btn-mini.active { background: var(--primary); border-color: var(--primary); color: #fff; }
 
 #btn-query.loading .btn-label { visibility: hidden; }
 #btn-query.loading::after {

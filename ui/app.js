@@ -125,6 +125,7 @@ let cfg = null;
 let sourcesData = {}; // {type: [{name, label?, requestCount}]}
 let activeListTab = "apm";
 let activeMetricTab = "apm";
+let appFilterSelectedOnly = false;
 let saveTimer = null;
 
 const $ = (id) => document.getElementById(id);
@@ -182,6 +183,7 @@ function renderScenarioChips() {
     box.appendChild(chip);
   }
   $("btn-scenario-delete").disabled = active === "自定义";
+  $("btn-scenario-save").textContent = active === "自定义" ? "存为场景" : "保存场景";
 }
 
 function switchScenario(name) {
@@ -209,12 +211,25 @@ function switchScenario(name) {
 }
 
 function saveScenario() {
+  const snap = snapshotSelection();
+  // 已激活命名场景：直接保存（覆盖），不再弹命名
+  if (cfg.activeScenario && cfg.activeScenario !== "自定义") {
+    const s = cfg.scenarios.find((x) => x.name === cfg.activeScenario);
+    if (s) {
+      s.apps = snap.apps;
+      s.dbInstances = snap.dbInstances;
+      s.metrics = snap.metrics;
+      renderScenarioChips();
+      scheduleSave();
+      showOk(`场景「${s.name}」已保存`);
+      return;
+    }
+  }
   let name = window.prompt("场景名称：", "");
   name = (name || "").trim();
   if (!name || name === "自定义") return;
   if (!cfg.scenarios) cfg.scenarios = [];
   const exist = cfg.scenarios.find((x) => x.name === name);
-  const snap = snapshotSelection();
   if (exist) {
     exist.apps = snap.apps;
     exist.dbInstances = snap.dbInstances;
@@ -426,7 +441,11 @@ function renderApps(animateIn) {
   const list = $("app-list");
   list.innerHTML = "";
   const items = sourcesData[t] || [];
-  const shown = items.filter((a) => (a.name + (a.label || "")).toLowerCase().includes(kw));
+  let shown = items.filter((a) => (a.name + (a.label || "")).toLowerCase().includes(kw));
+  if (appFilterSelectedOnly) {
+    const sel = selectedListOf(t);
+    shown = shown.filter((a) => sel.includes(a.name));
+  }
   for (const a of shown) {
     const row = document.createElement("label");
     row.className = "check-item";
@@ -448,9 +467,11 @@ function renderApps(animateIn) {
     const empty = document.createElement("div");
     empty.className = "muted";
     empty.style.padding = "8px";
-    empty.textContent = items.length
-      ? "没有匹配的条目"
-      : `${SOURCE_NAMES[t]} 列表未加载，点「加载列表」拉取`;
+    empty.textContent = appFilterSelectedOnly
+      ? "当前页签还没有勾选任何条目"
+      : items.length
+        ? "没有匹配的条目"
+        : `${SOURCE_NAMES[t]} 列表未加载，点「加载列表」拉取`;
     list.appendChild(empty);
   }
   $("selected-app-count").textContent = selectedListOf(t).length;
@@ -920,6 +941,11 @@ function bindConfigInputs() {
     renderApps(false);
     renderListTabs();
     scheduleSave();
+  };
+  $("btn-app-selected").onclick = () => {
+    appFilterSelectedOnly = !appFilterSelectedOnly;
+    $("btn-app-selected").classList.toggle("active", appFilterSelectedOnly);
+    renderApps(false);
   };
   $("btn-refresh-metrics").onclick = refreshMetrics;
   $("btn-metrics-default").onclick = () => {
