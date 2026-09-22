@@ -40,10 +40,13 @@ const DEFAULT_METRICS = [
   { name: "qps_avg", view: "computed", cn: "平均(次/秒)" }, // 计算型：请求量÷窗口秒数
   { name: "error_request_count", view: "service_metric", cn: "异常请求量" },
   { name: "error_req_rate_avg", view: "service_metric", cn: "错误率" },
-  { name: "duration_p99", view: "service_metric", cn: "P99耗时" },
-  { name: "duration_p95", view: "service_metric", cn: "P95耗时" },
   { name: "duration_avg", view: "service_metric", cn: "平均耗时" },
   { name: "duration_max", view: "service_metric", cn: "最大耗时" },
+];
+// 以下 APM 指标默认不勾选，可在指标面板自行勾选
+const APM_OPTIONAL_METRICS = [
+  { name: "duration_p99", view: "service_metric", cn: "P99耗时" },
+  { name: "duration_p95", view: "service_metric", cn: "P95耗时" },
   { name: "duration_p50", view: "service_metric", cn: "P50耗时" },
   { name: "cpu_usage_percent_top", view: "instance_metric", cn: "CPU最高点" },
   { name: "jvm_heap_usage_percent_top", view: "instance_metric", cn: "内存最高点" },
@@ -1349,6 +1352,11 @@ async function init() {
   // 扩展视图指标仅进缓存（默认不勾选，指标面板自行勾选）
   for (const d of APM_VIEW_METRICS) {
     if (!cfg.metricCache.some((m) => m.name === d.name && m.view === d.view)) cfg.metricCache.push({ ...d });
+  }
+  // 可选 APM 指标：进缓存但默认不勾选（若历史配置里勾着，这里取消勾选）
+  for (const d of APM_OPTIONAL_METRICS) {
+    if (!cfg.metricCache.some((m) => m.name === d.name && m.view === d.view)) cfg.metricCache.push({ ...d });
+    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !(m.name === d.name && m.view === d.view));
   }
   if (!Array.isArray(cfg.selectedDeployments)) cfg.selectedDeployments = [];
   if (cfg.containerCluster === undefined) cfg.containerCluster = "";
