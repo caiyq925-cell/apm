@@ -44,9 +44,12 @@ const DEFAULT_METRICS = [
   { name: "duration_p95", view: "service_metric", cn: "P95耗时" },
   { name: "duration_avg", view: "service_metric", cn: "平均耗时" },
   { name: "duration_max", view: "service_metric", cn: "最大耗时" },
+  { name: "duration_p50", view: "service_metric", cn: "P50耗时" },
+  { name: "cpu_usage_percent_top", view: "instance_metric", cn: "CPU最高点" },
+  { name: "jvm_heap_usage_percent_top", view: "instance_metric", cn: "内存最高点" },
 ];
 
-// APM 扩展视图指标（SQL 调用 / MQ / JVM，全部实测可用；默认不勾选）
+// APM 扩展视图指标（SQL 调用 / MQ / JVM / 实例级，全部实测可用；默认不勾选）
 const APM_VIEW_METRICS = [
   { name: "request_count", view: "sql_metric", cn: "SQL请求数" },
   { name: "error_request_count", view: "sql_metric", cn: "SQL错误数" },
@@ -57,7 +60,13 @@ const APM_VIEW_METRICS = [
   { name: "jvm_memory_used", view: "runtime_metric", cn: "JVM已用内存" },
   { name: "jvm_memory_max", view: "runtime_metric", cn: "JVM最大内存" },
   { name: "jvm_gc_count", view: "runtime_metric", cn: "GC次数" },
+  { name: "jvm_gc_time", view: "runtime_metric", cn: "GC耗时" },
+  // 实例分析的两个指标（CPU最高点/内存最高点）已纳入默认勾选，见 DEFAULT_METRICS
 ];
+
+// APM 侧所有视图
+const APM_VIEWS = ["service_metric", "computed", "sql_metric", "mq_metric", "runtime_metric", "instance_metric"];
+const isApmView = (v) => APM_VIEWS.includes(v);
 
 // 数据源
 const SOURCE_ORDER = ["apm", "mysql", "redis", "mongodb"];
@@ -402,7 +411,7 @@ function renderMetricTabs() {
     const badge = document.createElement("span");
     badge.className = "badge";
     badge.textContent = cfg.selectedMetrics.filter((m) =>
-      t === "apm" ? ["service_metric", "computed"].includes(m.view) : m.view === t
+      t === "apm" ? isApmView(m.view) : m.view === t
     ).length;
     btn.appendChild(document.createTextNode(SOURCE_NAMES[t]));
     btn.appendChild(badge);
@@ -567,6 +576,7 @@ function renderMetrics() {
     addGroup("SQL 调用", defs.filter((d) => d.view === "sql_metric"));
     addGroup("MQ 消息", defs.filter((d) => d.view === "mq_metric"));
     addGroup("JVM 运行时", defs.filter((d) => d.view === "runtime_metric"));
+    addGroup("实例指标（多实例取最大）", defs.filter((d) => d.view === "instance_metric"));
   } else {
     addGroup(SOURCE_NAMES[t], DB_METRICS[t].map((d) => ({ ...d, view: t })));
   }
@@ -578,7 +588,7 @@ async function refreshMetrics() {
     const defs = await invoke("refresh_metric_defs", { config: cfg });
     if (!defs.length) throw "指标清单为空";
     cfg.metricCache = defs;
-    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !["service_metric", "computed"].includes(m.view) || defs.some((d) => d.name === m.name && d.view === m.view));
+    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !isApmView(m.view) || defs.some((d) => d.name === m.name && d.view === m.view));
     renderMetrics();
     scheduleSave();
     showOk(`指标清单已刷新，共 ${defs.length} 个`);
@@ -606,6 +616,7 @@ function fmtRate(v) {
 
 function fmtValue(name, v) {
   if (name.includes("rate")) return fmtRate(v);
+  if (name.includes("percent")) return `${Math.round(v * 10) / 10}%`;
   if (name.startsWith("duration")) return `${Math.round(v * 10) / 10} ms`;
   if (name.startsWith("jvm_memory")) return `${fmtCount(v)} MB`;
   return fmtCount(v);
@@ -631,7 +642,7 @@ async function query() {
   if (isEnabled("apm")) {
     if (!cfg.instanceId) return showErr("APM 已启用，请先填写业务系统 ID");
     if (!cfg.selectedApps.length) return showErr("APM 已启用，请先选择应用");
-    const metrics = cfg.selectedMetrics.filter((m) => ["service_metric", "computed"].includes(m.view));
+    const metrics = cfg.selectedMetrics.filter((m) => isApmView(m.view));
     if (!metrics.length) return showErr("APM 已启用，请先勾选指标");
     tasks.push(
       invoke("query_metrics", {
@@ -738,7 +749,7 @@ function apmLines(app, range) {
   const lines = [`**服务名：${app.name}**`];
   const secs = Math.max(1, range.end - range.start);
   for (const d of cfg.selectedMetrics) {
-    if (!["service_metric", "computed"].includes(d.view)) continue;
+    if (!isApmView(d.view)) continue;
     const label = `${range.prefix}${d.cn || d.name}`;
     let text;
     if (d.view === "computed") {
@@ -984,7 +995,7 @@ function bindConfigInputs() {
   $("btn-app-selected").onclick = () => setAppFilter(true);
   $("btn-refresh-metrics").onclick = refreshMetrics;
   $("btn-metrics-default").onclick = () => {
-    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !["service_metric", "computed"].includes(m.view));
+    cfg.selectedMetrics = cfg.selectedMetrics.filter((m) => !isApmView(m.view));
     cfg.selectedMetrics.push(...DEFAULT_METRICS.map((d) => ({ ...d })));
     renderMetrics();
     scheduleSave();

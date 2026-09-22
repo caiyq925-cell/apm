@@ -71,10 +71,15 @@ pub async fn query_metrics(
     }
     let ch = Arc::new(Channel::from_config(&config)?);
 
-    // 按视图分组指标，同一应用同一视图一次请求；computed 视图为前端自算（如 QPS），不发给服务端
+    // 按视图分组指标，同一应用同一视图一次请求；computed=前端自算，instance_metric=实例级（走旧网关）
     let mut by_view: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut instance_metrics: Vec<String> = Vec::new();
     for m in &metrics {
         if m.view == "computed" {
+            continue;
+        }
+        if m.view == "instance_metric" {
+            instance_metrics.push(m.name.clone());
             continue;
         }
         by_view.entry(m.view.clone()).or_default().push(m.name.clone());
@@ -93,6 +98,20 @@ pub async fn query_metrics(
             join.spawn(async move {
                 let r =
                     apm::fetch_app_metrics(&ch, &instance, &app, &view, &names, start_ts, end_ts).await;
+                drop(permit);
+                (app, r)
+            });
+        }
+        // 实例级指标（实例分析）：独立接口，多实例取最大
+        if !instance_metrics.is_empty() {
+            let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+            let ch = ch.clone();
+            let app = app.clone();
+            let instance = config.instance_id.clone();
+            let want = instance_metrics.clone();
+            join.spawn(async move {
+                let r =
+                    apm::fetch_instance_tops(&ch, &instance, &app, start_ts, end_ts, &want).await;
                 drop(permit);
                 (app, r)
             });

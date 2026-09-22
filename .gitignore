@@ -4,3 +4,7 @@ config.json
 *.log
 .DS_Store
 dist/
+
+# 抓包导出（含会话凭证，禁止提交）
+tools/capture_dump.json
+tools/*.dump.json

@@ -276,3 +276,69 @@ mod tests {
         assert_eq!(out, vec![("request_count".to_string(), 5.0)]);
     }
 }
+
+/// 实例级指标（APM「实例分析」）：多个实例按指标取最大值
+/// 实测：该接口必须一次请求整套指标（只传子集会报错），故固定请求全量再挑需要的
+pub async fn fetch_instance_tops(
+    ch: &Channel,
+    instance_id: &str,
+    app: &str,
+    start_sec: i64,
+    end_sec: i64,
+    want: &[String],
+) -> Result<Vec<(String, f64)>, String> {
+    const ALL_METRICS: [&str; 12] = [
+        "jvm_heap_usage_percent_top",
+        "cpu_usage_percent_top",
+        "qps",
+        "duration_avg",
+        "duration_p50",
+        "duration_p95",
+        "duration_p99",
+        "duration_max",
+        "error_req_rate_avg",
+        "error_request_count",
+        "request_count_sum",
+        "diagnostic_tab_presence",
+    ];
+    let metrics: Vec<Value> = ALL_METRICS
+        .iter()
+        .map(|m| json!({ "MetricName": m, "Compares": ["CompareByYesterday", "CompareByLastWeek"] }))
+        .collect();
+    let data = json!({
+        "Version": "2021-06-22",
+        "Language": "zh-CN",
+        "Filters": [
+            { "Key": "service.name", "Type": "=", "Value": app },
+            { "Key": "span.kind", "Type": "in", "Value": "consumer,server" }
+        ],
+        "StartTime": start_sec,
+        "EndTime": end_sec,
+        "Metrics": metrics,
+        "GroupBy": ["service.instance"],
+        "InstanceId": instance_id,
+        "OrderBy": { "Key": "cpu_usage_percent_top", "Value": "desc" }
+    });
+    let resp = ch.call("DescribeMetricRecords", &data).await?;
+
+    let mut max_of: std::collections::HashMap<String, f64> = Default::default();
+    if let Some(records) = resp["Records"].as_array() {
+        for r in records {
+            if let Some(fields) = r["Fields"].as_array() {
+                for f in fields {
+                    let key = f["Key"].as_str().unwrap_or("");
+                    if key.is_empty() || !want.iter().any(|w| w == key) {
+                        continue;
+                    }
+                    if let Some(v) = value_as_f64(&f["Value"]) {
+                        let e = max_of.entry(key.to_string()).or_insert(v);
+                        if v > *e {
+                            *e = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(max_of.into_iter().collect())
+}
