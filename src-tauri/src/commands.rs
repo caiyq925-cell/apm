@@ -256,3 +256,216 @@ pub async fn query_db_metrics(
     }
     Ok(out)
 }
+
+// ---------- 容器服务（TKE） ----------
+
+#[tauri::command]
+pub async fn list_clusters(config: Config) -> Result<Vec<crate::container::ClusterInfo>, String> {
+    let ch = Channel::from_config(&config)?;
+    crate::container::list_clusters(&ch).await
+}
+
+#[tauri::command]
+pub async fn list_namespaces(config: Config, cluster_id: String) -> Result<Vec<String>, String> {
+    let ch = Channel::from_config(&config)?;
+    crate::container::list_namespaces(&ch, &cluster_id).await
+}
+
+#[tauri::command]
+pub async fn list_deployments(
+    config: Config,
+    cluster_id: String,
+    namespace: String,
+) -> Result<Vec<crate::container::DeploymentInfo>, String> {
+    let ch = Channel::from_config(&config)?;
+    crate::container::list_deployments(&ch, &cluster_id, &namespace).await
+}
+
+/// 解析 k8s 资源量为数值：CPU→核（"500m"→0.5），内存→MiB（"6Gi"→6144）
+fn parse_cpu(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(v) = s.strip_suffix('m') {
+        return v.parse::<f64>().ok().map(|x| x / 1000.0);
+    }
+    s.parse::<f64>().ok()
+}
+
+fn parse_mem_mib(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len()));
+    let n: f64 = num.parse().ok()?;
+    let mib = match unit {
+        "Ki" => n / 1024.0,
+        "Mi" => n,
+        "Gi" => n * 1024.0,
+        "Ti" => n * 1024.0 * 1024.0,
+        "K" | "k" => n / 1024.0,
+        "M" => n,
+        "G" => n * 1024.0,
+        _ => n / (1024.0 * 1024.0), // 纯字节
+    };
+    Some(mib)
+}
+
+#[tauri::command]
+pub async fn query_container_metrics(
+    config: Config,
+    cluster_id: String,
+    namespace: String,
+    deployments: Vec<String>,
+    start_ts: i64,
+    end_ts: i64,
+    apm_metrics: Vec<MetricDef>,
+) -> Result<Vec<AppMetrics>, String> {
+    if deployments.is_empty() {
+        return Err("未选择工作负载".into());
+    }
+    let ch = Arc::new(Channel::from_config(&config)?);
+    // 该命名空间的工作负载信息（SW_AGENT_NAME / limit / 副本）
+    let all = crate::container::list_deployments(&ch, &cluster_id, &namespace).await?;
+    let info_map: std::collections::HashMap<String, crate::container::DeploymentInfo> =
+        all.into_iter().map(|d| (d.name.clone(), d)).collect();
+
+    // APM 指标按视图分组（computed / instance_metric 单独处理）
+    let mut apm_by_view: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut apm_instance: Vec<String> = Vec::new();
+    for m in &apm_metrics {
+        if m.view == "computed" {
+            continue;
+        }
+        if m.view == "instance_metric" {
+            apm_instance.push(m.name.clone());
+        } else {
+            apm_by_view.entry(m.view.clone()).or_default().push(m.name.clone());
+        }
+    }
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(5));
+    let mut join = tokio::task::JoinSet::new();
+    for name in &deployments {
+        let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
+        let ch = ch.clone();
+        let name = name.clone();
+        let info = info_map.get(&name).cloned();
+        let cluster_id = cluster_id.clone();
+        let namespace = namespace.clone();
+        let region = config.region.clone();
+        let apm_by_view = apm_by_view.clone();
+        let apm_instance = apm_instance.clone();
+        let apm_instance_id = config.instance_id.clone();
+        join.spawn(async move {
+            let mut values: Vec<MetricValue> = Vec::new();
+            let mut err: Option<String> = None;
+
+            let info = match info {
+                Some(i) => i,
+                None => {
+                    drop(permit);
+                    return (
+                        name,
+                        AppMetrics { name: String::new(), values, error: Some("工作负载不存在".into()) },
+                    );
+                }
+            };
+
+            // 1) 容器指标
+            let (pods, ready) = match crate::container::deployment_pods(&ch, &cluster_id, &namespace, &name).await {
+                Ok(v) => v,
+                Err(e) => {
+                    err = Some(format!("Pod 查询失败: {}", e));
+                    (Vec::new(), 0)
+                }
+            };
+            values.push(MetricValue { name: "pod_ready".into(), value: ready as f64 });
+            values.push(MetricValue { name: "pod_desired".into(), value: info.replicas as f64 });
+            match crate::container::pod_util_metrics(&ch, &cluster_id, &pods, start_ts, end_ts, &region).await {
+                Ok(list) => {
+                    for (k, v) in list {
+                        values.push(MetricValue { name: k, value: v });
+                    }
+                }
+                Err(e) => {
+                    if err.is_none() {
+                        err = Some(format!("容器指标查询失败: {}", e));
+                    }
+                }
+            }
+            if let Some(c) = parse_cpu(&info.cpu_limit) {
+                values.push(MetricValue { name: "cpu_limit_cores".into(), value: c });
+            }
+            if let Some(m) = parse_mem_mib(&info.mem_limit) {
+                values.push(MetricValue { name: "mem_limit_mib".into(), value: m });
+            }
+
+            // 2) APM 指标（SW_AGENT_NAME 严格匹配）
+            if info.apm_name.is_empty() {
+                if err.is_none() {
+                    err = Some("未配置 SW_AGENT_NAME，无法关联 APM 应用".into());
+                }
+            } else if !apm_by_view.is_empty() || !apm_instance.is_empty() {
+                for (view, names) in &apm_by_view {
+                    match apm::fetch_app_metrics(&ch, &apm_instance_id, &info.apm_name, view, names, start_ts, end_ts).await {
+                        Ok(vals) => {
+                            for (k, v) in vals {
+                                values.push(MetricValue { name: k, value: v });
+                            }
+                        }
+                        Err(e) => {
+                            if err.is_none() {
+                                err = Some(format!("APM 指标查询失败: {}", e));
+                            }
+                        }
+                    }
+                }
+                if !apm_instance.is_empty() {
+                    match apm::fetch_instance_tops(&ch, &apm_instance_id, &info.apm_name, start_ts, end_ts, &apm_instance).await {
+                        Ok(vals) => {
+                            for (k, v) in vals {
+                                values.push(MetricValue { name: k, value: v });
+                            }
+                        }
+                        Err(e) => {
+                            if err.is_none() {
+                                err = Some(format!("APM 实例指标查询失败: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+
+            drop(permit);
+            let display = if info.apm_name.is_empty() {
+                format!("{}（{}）", info.name, namespace)
+            } else {
+                format!("{}（{}）→ APM: {}", info.name, namespace, info.apm_name)
+            };
+            (
+                name,
+                AppMetrics { name: display, values, error: err },
+            )
+        });
+    }
+
+    let mut collected: std::collections::HashMap<String, AppMetrics> = Default::default();
+    while let Some(res) = join.join_next().await {
+        match res {
+            Ok((name, v)) => {
+                collected.insert(name, v);
+            }
+            Err(e) => return Err(format!("任务异常: {}", e)),
+        }
+    }
+    let mut out = Vec::new();
+    for name in &deployments {
+        if let Some(v) = collected.remove(name) {
+            out.push(v);
+        }
+    }
+    Ok(out)
+}

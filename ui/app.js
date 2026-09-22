@@ -69,8 +69,16 @@ const APM_VIEWS = ["service_metric", "computed", "sql_metric", "mq_metric", "run
 const isApmView = (v) => APM_VIEWS.includes(v);
 
 // 数据源
-const SOURCE_ORDER = ["apm", "mysql", "redis", "mongodb"];
-const SOURCE_NAMES = { apm: "APM 应用", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
+const SOURCE_ORDER = ["apm", "container", "mysql", "redis", "mongodb"];
+const SOURCE_NAMES = { apm: "APM 应用", container: "容器服务", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
+// 容器服务指标（TKE，占 limit 口径）
+const CONTAINER_METRICS = [
+  { name: "cpu_util_limit", cn: "CPU利用率(占limit)", unit: "%" },
+  { name: "mem_util_limit", cn: "内存利用率(占limit)", unit: "%" },
+  { name: "pod_ready", cn: "就绪Pod数", unit: "pod" },
+  { name: "cpu_limit_cores", cn: "单Pod CPU limit", unit: "核" },
+  { name: "mem_limit_mib", cn: "单Pod 内存 limit", unit: "MiB" },
+];
 const DB_TITLES = { mysql: "MySQL 实例", redis: "Redis 实例", mongodb: "MongoDB 实例" };
 // 数据库指标目录（全部经真实实例实测可用）
 const DB_METRICS = {
@@ -134,6 +142,8 @@ let cfg = null;
 let sourcesData = {}; // {type: [{name, label?, requestCount}]}
 let activeListTab = "apm";
 let activeMetricTab = "apm";
+let containerClusters = [];
+let containerNamespaces = [];
 let appFilterSelectedOnly = false;
 let saveTimer = null;
 
@@ -148,6 +158,7 @@ function snapshotSelection() {
     apps: [...cfg.selectedApps],
     dbInstances: JSON.parse(JSON.stringify(cfg.selectedDbInstances || {})),
     metrics: JSON.parse(JSON.stringify(cfg.selectedMetrics || [])),
+    deployments: [...(cfg.selectedDeployments || [])],
   };
 }
 
@@ -161,6 +172,7 @@ function applySelection(snap) {
   if (sources.size) cfg.enabledSources = [...sources];
   cfg.selectedApps = [...(snap.apps || [])];
   cfg.selectedDbInstances = JSON.parse(JSON.stringify(snap.dbInstances || {}));
+  cfg.selectedDeployments = [...(snap.deployments || [])];
   // 指标定义以当前版本目录为准补齐（老场景缺单位/展示标记时自动修正）
   cfg.selectedMetrics = (snap.metrics || []).map((m) => {
     const cat = (DB_METRICS[m.view] || []).find((d) => d.name === m.name);
@@ -180,6 +192,7 @@ function syncActiveScenario() {
   s.apps = snap.apps;
   s.dbInstances = snap.dbInstances;
   s.metrics = snap.metrics;
+  s.deployments = snap.deployments;
 }
 
 function scheduleSave() {
@@ -224,6 +237,7 @@ function switchScenario(name) {
       prev.apps = snap.apps;
       prev.dbInstances = snap.dbInstances;
       prev.metrics = snap.metrics;
+      prev.deployments = snap.deployments;
     }
   }
   cfg.activeScenario = name === "自定义" ? "" : name;
@@ -256,6 +270,7 @@ function saveScenario() {
       s.apps = snap.apps;
       s.dbInstances = snap.dbInstances;
       s.metrics = snap.metrics;
+      s.deployments = snap.deployments;
       renderScenarioChips();
       scheduleSave();
       showOk(`场景「${s.name}」已保存`);
@@ -272,8 +287,9 @@ function saveScenario() {
     exist.apps = snap.apps;
     exist.dbInstances = snap.dbInstances;
     exist.metrics = snap.metrics;
+    exist.deployments = snap.deployments;
   } else {
-    cfg.scenarios.push({ name, sources: snap.sources, apps: snap.apps, dbInstances: snap.dbInstances, metrics: snap.metrics });
+    cfg.scenarios.push({ name, sources: snap.sources, apps: snap.apps, dbInstances: snap.dbInstances, metrics: snap.metrics, deployments: snap.deployments });
   }
   cfg.activeScenario = name;
   renderScenarioChips();
@@ -348,7 +364,11 @@ function renderSourceChips() {
         if (!isEnabled(activeMetricTab)) activeMetricTab = cfg.enabledSources[0];
       } else {
         cfg.enabledSources.push(t);
-        if (t !== "apm" && !(cfg.selectedMetrics || []).some((m) => m.view === t)) {
+        if (t === "container") {
+          if (!(cfg.selectedMetrics || []).some((m) => m.view === t)) {
+            cfg.selectedMetrics.push(...CONTAINER_METRICS.map((d) => ({ ...d, view: t })));
+          }
+        } else if (t !== "apm" && !(cfg.selectedMetrics || []).some((m) => m.view === t)) {
           cfg.selectedMetrics.push(
             ...(DB_DEFAULT_SELECTED[t] || []).map((name) => {
               const def = DB_METRICS[t].find((d) => d.name === name);
@@ -433,6 +453,20 @@ async function loadSources(types) {
       try {
         if (t === "apm") {
           sourcesData[t] = await invoke("list_apps", { config: cfg });
+        } else if (t === "container") {
+          containerClusters = await invoke("list_clusters", { config: cfg });
+          if (!cfg.containerCluster && containerClusters.length) cfg.containerCluster = containerClusters[0].id;
+          if (cfg.containerCluster) {
+            containerNamespaces = await invoke("list_namespaces", { config: cfg, clusterId: cfg.containerCluster });
+            if (!containerNamespaces.includes(cfg.containerNamespace)) cfg.containerNamespace = containerNamespaces[0] || "";
+          }
+          if (cfg.containerCluster && cfg.containerNamespace) {
+            const list = await invoke("list_deployments", { config: cfg, clusterId: cfg.containerCluster, namespace: cfg.containerNamespace });
+            sourcesData[t] = list.map((d) => ({ name: d.name, label: d.apmName || "未配 SW_AGENT_NAME", requestCount: 0, meta: d }));
+          } else {
+            sourcesData[t] = [];
+          }
+          renderContainerPickers();
         } else {
           const list = await invoke("list_db_instances", { config: cfg, dbType: t });
           sourcesData[t] = list.map((d) => ({ name: d.id, label: d.name, requestCount: 0 }));
@@ -451,7 +485,9 @@ async function loadSources(types) {
 }
 
 function selectedListOf(t) {
-  return t === "apm" ? cfg.selectedApps : dbInstances(t);
+  if (t === "apm") return cfg.selectedApps;
+  if (t === "container") return cfg.selectedDeployments || (cfg.selectedDeployments = []);
+  return dbInstances(t);
 }
 
 function toggleSelected(t, name, checked) {
@@ -459,13 +495,63 @@ function toggleSelected(t, name, checked) {
   const i = list.indexOf(name);
   if (checked && i < 0) list.push(name);
   if (!checked && i >= 0) list.splice(i, 1);
-  if (t !== "apm") {
+  if (t === "container") {
+    cfg.selectedDeployments = list;
+  } else if (t !== "apm") {
     cfg.selectedDbInstances = cfg.selectedDbInstances || {};
     cfg.selectedDbInstances[t] = list;
   }
   $("selected-app-count").textContent = selectedListOf(activeListTab).length;
   renderListTabs();
   scheduleSave();
+}
+
+async function reloadContainerScope() {
+  cfg.selectedDeployments = [];
+  try {
+    containerNamespaces = await invoke("list_namespaces", { config: cfg, clusterId: cfg.containerCluster });
+    if (!containerNamespaces.includes(cfg.containerNamespace)) cfg.containerNamespace = containerNamespaces[0] || "";
+    if (cfg.containerNamespace) {
+      const list = await invoke("list_deployments", { config: cfg, clusterId: cfg.containerCluster, namespace: cfg.containerNamespace });
+      sourcesData.container = list.map((d) => ({ name: d.name, label: d.apmName || "未配 SW_AGENT_NAME", requestCount: 0, meta: d }));
+    } else {
+      sourcesData.container = [];
+    }
+    renderContainerPickers();
+    renderApps(true);
+    scheduleSave();
+  } catch (e) {
+    showErr(e);
+  }
+}
+
+function renderContainerPickers() {
+  const box = $("container-pickers");
+  if (!box) return;
+  const show = activeListTab === "container";
+  box.classList.toggle("hidden", !show);
+  if (!show) return;
+  box.innerHTML = "";
+  const mk = (labelText, options, value, onChange) => {
+    const label = document.createElement("label");
+    label.className = "field";
+    label.textContent = labelText;
+    const sel = document.createElement("select");
+    for (const o of options) {
+      const opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.text;
+      sel.appendChild(opt);
+    }
+    sel.value = value || "";
+    sel.onchange = () => onChange(sel.value);
+    label.appendChild(sel);
+    return label;
+  };
+  box.appendChild(mk("集群", containerClusters.map((c) => ({ value: c.id, text: `${c.name}（${c.id}）` })), cfg.containerCluster,
+    (v) => { cfg.containerCluster = v; cfg.containerNamespace = ""; reloadContainerScope(); }));
+  box.appendChild(mk("命名空间", containerNamespaces.map((n) => ({ value: n, text: n })), cfg.containerNamespace,
+    (v) => { cfg.containerNamespace = v; reloadContainerScope(); }));
 }
 
 function setAppFilter(selectedOnly) {
@@ -483,6 +569,7 @@ function renderApps(animateIn) {
     else return;
   }
   const kw = ($("app-search")?.value || "").trim().toLowerCase();
+  renderContainerPickers();
   const list = $("app-list");
   list.innerHTML = "";
   const items = sourcesData[t] || [];
@@ -654,6 +741,22 @@ async function query() {
       }).then((results) => ({ src: "apm", results }))
     );
   }
+  if (isEnabled("container")) {
+    if (!cfg.containerCluster || !cfg.containerNamespace) return showErr("容器服务已启用，请先选择集群与命名空间");
+    if (!(cfg.selectedDeployments || []).length) return showErr("容器服务已启用，请先选择工作负载");
+    if (!cfg.selectedMetrics.some((m) => m.view === "container")) return showErr("容器服务已启用，请先勾选容器指标");
+    tasks.push(
+      invoke("query_container_metrics", {
+        config: cfg,
+        clusterId: cfg.containerCluster,
+        namespace: cfg.containerNamespace,
+        deployments: cfg.selectedDeployments,
+        startTs: r.start,
+        endTs: r.end,
+        apmMetrics: cfg.selectedMetrics.filter((m) => isApmView(m.view)),
+      }).then((results) => ({ src: "container", results }))
+    );
+  }
   for (const t of ["mysql", "redis", "mongodb"]) {
     if (!isEnabled(t)) continue;
     const instances = dbInstances(t);
@@ -769,6 +872,43 @@ function apmLines(app, range) {
   return lines;
 }
 
+function containerLines(app, range) {
+  const v = (n) => {
+    const x = app.values.find((y) => y.name === n);
+    return x ? x.value : undefined;
+  };
+  const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === "container");
+  const p = range.dbPrefix;
+  const lines = [`**${app.name}**`];
+  for (const d of CONTAINER_METRICS) {
+    if (!has(d.name)) continue;
+    const val = v(d.name);
+    if (d.name === "pod_ready") {
+      const desired = v("pod_desired");
+      lines.push(p + "就绪Pod数：" + (val === undefined ? "-" : val + (desired !== undefined ? "/" + desired : "") + " 个"));
+    } else if (d.unit === "%") {
+      lines.push(p + d.cn + "：" + (val === undefined ? "-" : (Math.round(val * 10) / 10) + "%"));
+    } else {
+      lines.push(p + d.cn + "：" + (val === undefined ? "-" : fmtCount(val) + " " + d.unit));
+    }
+  }
+  const secs = Math.max(1, range.end - range.start);
+  for (const d of cfg.selectedMetrics.filter((m) => isApmView(m.view))) {
+    const label = range.prefix + (d.cn || d.name);
+    let text;
+    if (d.view === "computed") {
+      const req = v("request_count");
+      text = d.name === "qps_avg" && req !== undefined ? Math.round((req / secs) * 10) / 10 + " 次/秒" : "-";
+    } else {
+      const val = v(d.name);
+      text = val !== undefined ? fmtValue(d.name, val) : "-";
+    }
+    lines.push(label + "：" + text);
+  }
+  if (app.error) lines.push("（" + app.error + "）");
+  return lines;
+}
+
 function renderResults(groups, range) {
   const box = $("results");
   box.innerHTML = "";
@@ -779,7 +919,11 @@ function renderResults(groups, range) {
       continue;
     }
     for (const app of g.results) {
-      blocks.push(g.src === "apm" ? apmLines(app, range) : dbLines(app, range, g.src));
+      blocks.push(
+        g.src === "apm" ? apmLines(app, range)
+          : g.src === "container" ? containerLines(app, range)
+            : dbLines(app, range, g.src)
+      );
     }
   }
   for (const lines of blocks) {
@@ -1062,6 +1206,12 @@ async function init() {
   // 扩展视图指标仅进缓存（默认不勾选，指标面板自行勾选）
   for (const d of APM_VIEW_METRICS) {
     if (!cfg.metricCache.some((m) => m.name === d.name && m.view === d.view)) cfg.metricCache.push({ ...d });
+  }
+  if (!Array.isArray(cfg.selectedDeployments)) cfg.selectedDeployments = [];
+  if (cfg.containerCluster === undefined) cfg.containerCluster = "";
+  if (cfg.containerNamespace === undefined) cfg.containerNamespace = "";
+  if (isEnabled("container") && !cfg.selectedMetrics.some((m) => m.view === "container")) {
+    cfg.selectedMetrics.push(...CONTAINER_METRICS.map((d) => ({ ...d, view: "container" })));
   }
   // 补充已启用数据源默认勾选的核心数据库指标（新增指标不再自动全选，由用户自行勾选）
   for (const t of ["mysql", "redis", "mongodb"]) {

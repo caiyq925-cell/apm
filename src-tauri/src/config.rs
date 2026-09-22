@@ -57,6 +57,10 @@ pub struct Config {
     // 场景预设与当前激活场景（空/"自定义" 表示手动模式）
     pub scenarios: Vec<Scenario>,
     pub active_scenario: String,
+    // 容器服务（TKE）：当前集群/命名空间与已选工作负载
+    pub container_cluster: String,
+    pub container_namespace: String,
+    pub selected_deployments: Vec<String>,
 }
 
 fn default_sources() -> Vec<String> {

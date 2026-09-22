@@ -4,6 +4,7 @@ mod apm;
 mod commands;
 mod config;
 mod console;
+mod container;
 mod db;
 mod tc3;
 
@@ -17,7 +18,11 @@ fn main() {
             commands::query_metrics,
             commands::validate_cookie,
             commands::list_db_instances,
-            commands::query_db_metrics
+            commands::query_db_metrics,
+            commands::list_clusters,
+            commands::list_namespaces,
+            commands::list_deployments,
+            commands::query_container_metrics
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
