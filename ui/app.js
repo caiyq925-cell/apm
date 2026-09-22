@@ -143,10 +143,22 @@ function snapshotSelection() {
 }
 
 function applySelection(snap) {
-  if (Array.isArray(snap.sources) && snap.sources.length) cfg.enabledSources = [...snap.sources];
+  // 数据源：场景显式记录的 + 从内容反推的（兼容早期没有 sources 字段的老场景）
+  const sources = new Set((snap.sources || []).filter(Boolean));
+  if ((snap.apps || []).length) sources.add("apm");
+  for (const [k, v] of Object.entries(snap.dbInstances || {})) {
+    if ((v || []).length) sources.add(k);
+  }
+  if (sources.size) cfg.enabledSources = [...sources];
   cfg.selectedApps = [...(snap.apps || [])];
   cfg.selectedDbInstances = JSON.parse(JSON.stringify(snap.dbInstances || {}));
-  cfg.selectedMetrics = JSON.parse(JSON.stringify(snap.metrics || []));
+  // 指标定义以当前版本目录为准补齐（老场景缺单位/展示标记时自动修正）
+  cfg.selectedMetrics = (snap.metrics || []).map((m) => {
+    const cat = (DB_METRICS[m.view] || []).find((d) => d.name === m.name);
+    if (cat) return { ...cat, view: m.view };
+    const apm = [...DEFAULT_METRICS, ...APM_VIEW_METRICS].find((d) => d.name === m.name && d.view === m.view);
+    return apm ? { ...apm } : { ...m };
+  });
 }
 
 // 激活场景时，界面上的一切勾选改动实时回写到场景
@@ -208,6 +220,9 @@ function switchScenario(name) {
   cfg.activeScenario = name === "自定义" ? "" : name;
   const s = (cfg.scenarios || []).find((x) => x.name === name);
   if (s) applySelection(s);
+  // 清掉搜索词与「已选」筛选，保证场景里的对象立刻可见
+  $("app-search").value = "";
+  setAppFilter(false);
   renderScenarioChips();
   renderSourceChips();
   renderTabs();
