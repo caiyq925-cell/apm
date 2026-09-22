@@ -73,11 +73,11 @@ const SOURCE_ORDER = ["apm", "container", "mysql", "redis", "mongodb"];
 const SOURCE_NAMES = { apm: "APM 应用", container: "容器服务", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
 // 容器服务指标（TKE，占 limit 口径）
 const CONTAINER_METRICS = [
-  { name: "cpu_util_limit", cn: "CPU利用率(占limit)", unit: "%" },
-  { name: "mem_util_limit", cn: "内存利用率(占limit)", unit: "%" },
-  { name: "pod_ready", cn: "就绪Pod数", unit: "pod" },
-  { name: "cpu_limit_cores", cn: "单Pod CPU limit", unit: "核" },
-  { name: "mem_limit_mib", cn: "单Pod 内存 limit", unit: "MiB" },
+  { name: "cpu_util_limit", cn: "CPU最大利用率", unit: "%" },
+  { name: "mem_util_limit", cn: "内存最大利用率", unit: "%" },
+  { name: "pod_ready", cn: "Pod数", unit: "pod" },
+  { name: "cpu_limit_cores", cn: "CPU limit", unit: "核" },
+  { name: "mem_limit_mib", cn: "内存 limit", unit: "MiB" },
 ];
 const DB_TITLES = { mysql: "MySQL 实例", redis: "Redis 实例", mongodb: "MongoDB 实例" };
 // 数据库指标目录（全部经真实实例实测可用）
@@ -880,18 +880,13 @@ function containerLines(app, range) {
   const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === "container");
   const p = range.dbPrefix;
   const lines = [`**服务名：${app.name}**`];
-  for (const d of CONTAINER_METRICS) {
-    if (!has(d.name)) continue;
-    const val = v(d.name);
-    if (d.name === "pod_ready") {
-      const desired = v("pod_desired");
-      lines.push(p + "就绪Pod数：" + (val === undefined ? "-" : val + (desired !== undefined ? "/" + desired : "") + " 个"));
-    } else if (d.unit === "%") {
-      lines.push(p + d.cn + "：" + (val === undefined ? "-" : (Math.round(val * 10) / 10) + "%"));
-    } else {
-      lines.push(p + d.cn + "：" + (val === undefined ? "-" : fmtCount(val) + " " + d.unit));
-    }
-  }
+  const pct = (n) => {
+    const x = v(n);
+    return x === undefined ? "-" : `${Math.round(x * 10) / 10}%`;
+  };
+  // 1) 容器利用率（带时间前缀）
+  if (has("cpu_util_limit")) lines.push(`${p}CPU最大利用率：${pct("cpu_util_limit")}`);
+  if (has("mem_util_limit")) lines.push(`${p}内存最大利用率：${pct("mem_util_limit")}`);
   const secs = Math.max(1, range.end - range.start);
   for (const d of cfg.selectedMetrics.filter((m) => isApmView(m.view))) {
     const label = range.prefix + (d.cn || d.name);
@@ -904,6 +899,16 @@ function containerLines(app, range) {
       text = val !== undefined ? fmtValue(d.name, val) : "-";
     }
     lines.push(label + "：" + text);
+  }
+  // 2) 容器规格与副本数（不带时间前缀）
+  const ready = v("pod_ready");
+  if (has("pod_ready") && ready !== undefined) lines.push(`Pod数：${fmtCount(ready)}个`);
+  const cpuLim = v("cpu_limit_cores");
+  if (has("cpu_limit_cores") && cpuLim !== undefined) lines.push(`CPU：${fmtCount(cpuLim)} 核`);
+  const memLim = v("mem_limit_mib");
+  if (has("mem_limit_mib") && memLim !== undefined) {
+    const txt = memLim >= 1024 ? `${Math.round((memLim / 1024) * 10) / 10}GB`.replace(".0GB", "GB") : `${fmtCount(memLim)}MB`;
+    lines.push(`内存：${txt}`);
   }
   if (app.error) lines.push("（" + app.error + "）");
   return lines;
