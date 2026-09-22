@@ -440,11 +440,7 @@ pub async fn query_container_metrics(
             }
 
             drop(permit);
-            let display = if info.apm_name.is_empty() {
-                format!("{}（{}）", info.name, namespace)
-            } else {
-                format!("{}（{}）→ APM: {}", info.name, namespace, info.apm_name)
-            };
+            let display = info.name.clone();
             (
                 name,
                 AppMetrics { name: display, values, error: err },

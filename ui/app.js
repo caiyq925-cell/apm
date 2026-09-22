@@ -879,7 +879,7 @@ function containerLines(app, range) {
   };
   const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === "container");
   const p = range.dbPrefix;
-  const lines = [`**${app.name}**`];
+  const lines = [`**服务名：${app.name}**`];
   for (const d of CONTAINER_METRICS) {
     if (!has(d.name)) continue;
     const val = v(d.name);
