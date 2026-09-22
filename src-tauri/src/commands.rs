@@ -259,6 +259,16 @@ pub async fn query_db_metrics(
 
 // ---------- 容器服务（TKE） ----------
 
+/// 控制台专属能力（K8s 资源列表/平台转发）只有 Cookie 通道有；官方 API 无对应接口
+fn console_channel(config: &Config) -> Result<Channel, String> {
+    if !config.cookie.trim().is_empty() {
+        Ok(Channel::Cookie(config.clone()))
+    } else {
+        Err("请先在设置中完成登录（Cookie），工作负载与 Pod 列表需要控制台会话".into())
+    }
+}
+
+
 #[tauri::command]
 pub async fn list_clusters(config: Config) -> Result<Vec<crate::container::ClusterInfo>, String> {
     let ch = Channel::from_config(&config)?;
@@ -277,7 +287,7 @@ pub async fn list_deployments(
     cluster_id: String,
     namespace: String,
 ) -> Result<Vec<crate::container::DeploymentInfo>, String> {
-    let ch = Channel::from_config(&config)?;
+    let ch = console_channel(&config)?;
     crate::container::list_deployments(&ch, &cluster_id, &namespace).await
 }
 
@@ -326,8 +336,9 @@ pub async fn query_container_metrics(
     if deployments.is_empty() {
         return Err("未选择工作负载".into());
     }
-    let ch = Arc::new(Channel::from_config(&config)?);
-    // 配置了密钥时，额外准备一个官方 API 通道作为容器指标的兜底
+    // 资源列表（Deployment/Pod/SW_AGENT_NAME）走 Cookie 通道
+    let ch = Arc::new(console_channel(&config)?);
+    // 配置了密钥时，容器指标优先走官方 API（长期有效）
     let fallback_ch: Option<Arc<Channel>> = if !config.secret_id.is_empty() && !config.secret_key.is_empty() {
         Some(Arc::new(Channel::Secret {
             region: config.region.clone(),

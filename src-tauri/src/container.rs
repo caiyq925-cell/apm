@@ -231,17 +231,6 @@ fn iso_local(secs: i64) -> String {
         .unwrap_or_default()
 }
 
-fn dims_to_official(cluster_id: &str, pods: &[String], region: &str) -> Value {
-    let mut dims = vec![
-        json!({ "Name": "region", "Value": region }),
-        json!({ "Name": "tke_cluster_instance_id", "Value": cluster_id }),
-    ];
-    if let Some(first) = pods.first() {
-        dims.push(json!({ "Name": "pod_name", "Value": first }));
-    }
-    json!(dims)
-}
-
 fn dimension_json(region: &str, cluster_id: &str, pods: &[String]) -> String {
     let mut items = vec![
         json!({ "Key": "region", "Value": [region], "Operator": "eq" }),
@@ -290,30 +279,16 @@ pub async fn pod_util_metrics(
         "Module": "monitor",
         "Query": queries
     });
-    // 新网关对 QCE/TKE2 的 dashboard 查询返回空，必须走旧网关 /cgi/capi（会话令牌时效短）
-    let resp = match ch.call_capi("monitor", "DescribeDashboardMetricData", &payload).await {
-        Ok(r) => r,
-        Err(e) => {
-            // 兜底：配置了密钥时改用官方监控 API（无会话令牌限制）
-            match fallback {
-                Some(fb) => {
-                    let dims_vec = dims_to_official(cluster_id, pods, region);
-                    let p2 = json!({
-                        "Version": "2018-07-24",
-                        "Namespace": "QCE/TKE2",
-                        "MetricName": METRICS[0].1,
-                        "Instances": [{ "Dimensions": dims_vec }],
-                        "Period": 60,
-                        "StartTime": iso_local(start),
-                        "EndTime": iso_local(end)
-                    });
-                    let _ = fb.call_service("monitor", "2018-07-24", "GetMonitorData", &p2).await?;
-                    return Err(format!("容器指标（旧网关）失败：{}；官方 API 兜底暂只支持单指标查询", e));
-                }
-                None => return Err(e),
+    // 优先：配置了密钥时走官方监控 API（长期有效，不受控制台会话令牌限制）
+    if let Some(fb) = fallback {
+        if let Ok(list) = official_util_metrics(fb, cluster_id, pods, start, end, region).await {
+            if !list.is_empty() {
+                return Ok(list);
             }
         }
-    };
+    }
+    // 兜底：控制台旧网关 dashboard 接口（会话令牌时效短）
+    let resp = ch.call_capi("monitor", "DescribeDashboardMetricData", &payload).await?;
 
     let mut out: Vec<(String, f64)> = Vec::new();
     let data = resp["Data"].as_array().cloned().unwrap_or_default();
@@ -334,6 +309,71 @@ pub async fn pod_util_metrics(
         if let Some(m) = max {
             out.push((key.to_string(), m));
         }
+    }
+    Ok(out)
+}
+
+
+/// 官方监控 API：按 Pod 维度取容器利用率（一次请求可带多个 Pod 实例）
+async fn official_util_metrics(
+    fb: &Channel,
+    cluster_id: &str,
+    pods: &[String],
+    start: i64,
+    end: i64,
+    region: &str,
+) -> Result<Vec<(String, f64)>, String> {
+    const METRICS: [(&str, &str); 2] = [
+        ("cpu_util_limit", "K8sPodRateCpuCoreUsedLimit"),
+        ("mem_util_limit", "K8sPodRateMemNoCacheLimit"),
+    ];
+    let instances: Vec<Value> = if pods.is_empty() {
+        vec![json!({ "Dimensions": [
+            { "Name": "region", "Value": region },
+            { "Name": "tke_cluster_instance_id", "Value": cluster_id }
+        ]})]
+    } else {
+        pods.iter()
+            .map(|p| {
+                json!({ "Dimensions": [
+                    { "Name": "region", "Value": region },
+                    { "Name": "tke_cluster_instance_id", "Value": cluster_id },
+                    { "Name": "pod_name", "Value": p }
+                ]})
+            })
+            .collect()
+    };
+
+    let mut out: Vec<(String, f64)> = Vec::new();
+    let mut last_err = String::new();
+    for (key, metric) in METRICS {
+        let payload = json!({
+            "Namespace": "QCE/TKE2",
+            "MetricName": metric,
+            "Instances": instances,
+            "Period": 60,
+            "StartTime": iso_local(start),
+            "EndTime": iso_local(end)
+        });
+        match fb.call_service("monitor", "2018-07-24", "GetMonitorData", &payload).await {
+            Ok(resp) => {
+                let mut max: Option<f64> = None;
+                for d in resp["DataPoints"].as_array().unwrap_or(&vec![]) {
+                    for v in d["Values"].as_array().unwrap_or(&vec![]) {
+                        if let Some(f) = v.as_f64() {
+                            max = Some(max.map_or(f, |m: f64| m.max(f)));
+                        }
+                    }
+                }
+                if let Some(m) = max {
+                    out.push((key.to_string(), m));
+                }
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    if out.is_empty() && !last_err.is_empty() {
+        return Err(last_err);
     }
     Ok(out)
 }

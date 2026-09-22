@@ -30,7 +30,14 @@ pub async fn call_api(
     cred: &Tc3Credential,
 ) -> Result<serde_json::Value, String> {
     let host = format!("{}.tencentcloudapi.com", service);
-    let body = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+    // 官方 API 不接受控制台专用字段（Version 走 X-TC-Version 头、Language/Region 等也不属于业务参数）
+    let mut clean = payload.clone();
+    if let Some(obj) = clean.as_object_mut() {
+        for k in ["Version", "Language", "Region", "regionId", "SpaceUUID", "Module"] {
+            obj.remove(k);
+        }
+    }
+    let body = serde_json::to_string(&clean).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let ts = now.timestamp();
     let date = now.format("%Y-%m-%d").to_string();
