@@ -1426,4 +1426,12 @@ async function init() {
   }
 }
 
+// 监听后端「会话刷新中」事件
+try {
+  window.__TAURI__.event.listen("session-refresh", (e) => {
+    $("status").classList.remove("ok");
+    $("status").textContent = String(e.payload || "");
+  });
+} catch (_) {}
+
 init().catch(showErr);
