@@ -135,6 +135,7 @@ const dbInstances = (t) => (cfg.selectedDbInstances && cfg.selectedDbInstances[t
 // ---------- 配置持久化 ----------
 function snapshotSelection() {
   return {
+    sources: [...cfg.enabledSources],
     apps: [...cfg.selectedApps],
     dbInstances: JSON.parse(JSON.stringify(cfg.selectedDbInstances || {})),
     metrics: JSON.parse(JSON.stringify(cfg.selectedMetrics || [])),
@@ -142,6 +143,7 @@ function snapshotSelection() {
 }
 
 function applySelection(snap) {
+  if (Array.isArray(snap.sources) && snap.sources.length) cfg.enabledSources = [...snap.sources];
   cfg.selectedApps = [...(snap.apps || [])];
   cfg.selectedDbInstances = JSON.parse(JSON.stringify(snap.dbInstances || {}));
   cfg.selectedMetrics = JSON.parse(JSON.stringify(snap.metrics || []));
@@ -153,6 +155,7 @@ function syncActiveScenario() {
   const s = (cfg.scenarios || []).find((x) => x.name === cfg.activeScenario);
   if (!s) return;
   const snap = snapshotSelection();
+  s.sources = snap.sources;
   s.apps = snap.apps;
   s.dbInstances = snap.dbInstances;
   s.metrics = snap.metrics;
@@ -176,7 +179,10 @@ function renderScenarioChips() {
     let label = name;
     if (name !== "自定义") {
       const s = cfg.scenarios.find((x) => x.name === name);
-      if (s) label += `（APM ${s.apps.length} · 库 ${(Object.values(s.dbInstances || {})).reduce((n, v) => n + v.length, 0)}）`;
+      if (s) {
+        const src = (s.sources || []).map((k) => SOURCE_NAMES[k] || k).join(" ");
+        label += `（${src || "自定义"} · 应用 ${s.apps.length} · 库 ${(Object.values(s.dbInstances || {})).reduce((n, v) => n + v.length, 0)}）`;
+      }
     }
     chip.textContent = label;
     chip.onclick = () => switchScenario(name);
@@ -193,6 +199,7 @@ function switchScenario(name) {
     const prev = (cfg.scenarios || []).find((x) => x.name === cfg.activeScenario);
     if (prev) {
       const snap = snapshotSelection();
+      prev.sources = snap.sources;
       prev.apps = snap.apps;
       prev.dbInstances = snap.dbInstances;
       prev.metrics = snap.metrics;
@@ -208,6 +215,11 @@ function switchScenario(name) {
   renderMetrics();
   updateSettingsHint();
   scheduleSave();
+  // 场景切换后，自动加载该场景启用但尚未拉取过列表的数据源
+  if ((cfg.cookie || cfg.secretId)) {
+    const missing = cfg.enabledSources.filter((t) => isEnabled(t) && !sourcesData[t]);
+    if (missing.length) loadSources(missing);
+  }
 }
 
 function saveScenario() {
@@ -216,6 +228,7 @@ function saveScenario() {
   if (cfg.activeScenario && cfg.activeScenario !== "自定义") {
     const s = cfg.scenarios.find((x) => x.name === cfg.activeScenario);
     if (s) {
+      s.sources = snap.sources;
       s.apps = snap.apps;
       s.dbInstances = snap.dbInstances;
       s.metrics = snap.metrics;
@@ -231,11 +244,12 @@ function saveScenario() {
   if (!cfg.scenarios) cfg.scenarios = [];
   const exist = cfg.scenarios.find((x) => x.name === name);
   if (exist) {
+    exist.sources = snap.sources;
     exist.apps = snap.apps;
     exist.dbInstances = snap.dbInstances;
     exist.metrics = snap.metrics;
   } else {
-    cfg.scenarios.push({ name, apps: snap.apps, dbInstances: snap.dbInstances, metrics: snap.metrics });
+    cfg.scenarios.push({ name, sources: snap.sources, apps: snap.apps, dbInstances: snap.dbInstances, metrics: snap.metrics });
   }
   cfg.activeScenario = name;
   renderScenarioChips();

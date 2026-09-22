@@ -17,11 +17,13 @@ impl Default for MetricDef {
     }
 }
 
-/// 场景预设：一组 APM 应用 + 数据库实例 + 指标的快照
+/// 场景预设：启用的数据源 + APM 应用 + 数据库实例 + 指标的快照
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Scenario {
     pub name: String,
+    /// 该场景启用的数据源（如 ["apm","mysql"]）
+    pub sources: Vec<String>,
     pub apps: Vec<String>,
     pub db_instances: BTreeMap<String, Vec<String>>,
     pub metrics: Vec<MetricDef>,
