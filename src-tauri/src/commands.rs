@@ -271,13 +271,13 @@ fn console_channel(config: &Config) -> Result<Channel, String> {
 
 #[tauri::command]
 pub async fn list_clusters(config: Config) -> Result<Vec<crate::container::ClusterInfo>, String> {
-    let ch = Channel::from_config(&config)?;
+    let ch = console_channel(&config)?;
     crate::container::list_clusters(&ch).await
 }
 
 #[tauri::command]
 pub async fn list_namespaces(config: Config, cluster_id: String) -> Result<Vec<String>, String> {
-    let ch = Channel::from_config(&config)?;
+    let ch = console_channel(&config)?;
     crate::container::list_namespaces(&ch, &cluster_id).await
 }
 
