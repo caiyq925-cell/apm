@@ -322,6 +322,22 @@ function showOk(msg) {
   setTimeout(() => { if ($("status").textContent === msg) $("status").textContent = ""; }, 5000);
 }
 
+// ---------- 实时日志 ----------
+let logCount = 0;
+function logLine(msg, kind) {
+  const box = $("log-box");
+  if (!box) return;
+  const now = new Date();
+  const t = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+  const line = document.createElement("div");
+  if (kind) line.className = kind;
+  line.innerHTML = `<span class="t">[${t}]</span> ${String(msg).replace(/</g, "&lt;")}`;
+  box.appendChild(line);
+  logCount += 1;
+  while (box.childElementCount > 400) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
 // ---------- 时间 ----------
 function resolveRange() {
   const now = Math.floor(Date.now() / 1000);
@@ -839,6 +855,30 @@ function mdRender(md) {
     .replace(/\n/g, "<br>");
 }
 
+let queryTimer = null;
+let queryToken = 0;
+
+function startQueryUi() {
+  queryToken += 1;
+  const startedAt = Date.now();
+  $("btn-stop").classList.remove("hidden");
+  if (queryTimer) clearInterval(queryTimer);
+  queryTimer = setInterval(() => {
+    const s = Math.round((Date.now() - startedAt) / 1000);
+    $("status").classList.remove("ok");
+    $("status").textContent = `统计中… 已用时 ${s}s（可点「停止」中断）`;
+  }, 1000);
+  logLine("开始统计…", "ok");
+}
+
+function endQueryUi() {
+  if (queryTimer) {
+    clearInterval(queryTimer);
+    queryTimer = null;
+  }
+  $("btn-stop").classList.add("hidden");
+}
+
 async function query() {
   const r = resolveRange();
   if (!r) return showErr("时间范围无效");
@@ -884,20 +924,32 @@ async function query() {
     b.disabled = true;
     b.classList.add("loading");
   }
-  $("status").textContent = "查询中…";
+  startQueryUi();
+  const myToken = queryToken;
   try {
     const settled = await Promise.allSettled(tasks);
+    if (myToken !== queryToken) {
+      logLine("本次查询已停止，忽略返回结果");
+      return;
+    }
     const groups = [];
     for (const s of settled) {
       if (s.status === "fulfilled") groups.push(s.value);
-      else groups.push({ src: "error", results: [], error: String(s.reason) });
+      else {
+        const msg = String(s.reason);
+        logLine(`查询出错：${msg}`, "err");
+        groups.push({ src: "error", results: [], error: msg });
+      }
     }
     renderResults(groups, r);
     const total = groups.reduce((n, g) => n + g.results.length, 0);
+    logLine(`统计完成：${total} 个对象`, "ok");
     showOk(`统计完成：${total} 个对象`);
   } catch (e) {
+    logLine(`统计失败：${e}`, "err");
     showErr(e);
   } finally {
+    endQueryUi();
     for (const id of ["btn-query", "btn-query-2"]) {
       const b = $(id);
       b.disabled = false;
@@ -1253,6 +1305,20 @@ function bindConfigInputs() {
     renderMetrics();
     scheduleSave();
   };
+  $("btn-stop").onclick = () => {
+    queryToken += 1; // 让返回结果失效
+    logLine("已请求停止（后台正在收尾）…", "err");
+    invoke("cancel_query").catch(() => {});
+    endQueryUi();
+    for (const id of ["btn-query", "btn-query-2"]) {
+      const b = $(id);
+      b.disabled = false;
+      b.classList.remove("loading");
+    }
+    $("status").classList.remove("ok");
+    $("status").textContent = "已停止";
+  };
+  $("btn-log-clear").onclick = () => { $("log-box").innerHTML = ""; logCount = 0; };
   $("btn-query").onclick = query;
   $("btn-query-2").onclick = query;
   $("btn-copy-all").onclick = () => {
@@ -1426,9 +1492,11 @@ async function init() {
   }
 }
 
-// 监听后端「会话刷新中」事件
+// 监听后端事件：进度日志 / 会话刷新
 try {
+  window.__TAURI__.event.listen("query-log", (e) => logLine(e.payload));
   window.__TAURI__.event.listen("session-refresh", (e) => {
+    logLine(String(e.payload || ""), "err");
     $("status").classList.remove("ok");
     $("status").textContent = String(e.payload || "");
   });

@@ -325,3 +325,24 @@ button:disabled { opacity: 0.5; cursor: wait; }
 .combo-item:hover, .combo-item.hover { background: #eef4ff; }
 .combo-item.active { color: var(--primary); font-weight: 600; }
 .combo-empty { padding: 6px 9px; color: var(--muted); font-size: 12px; }
+
+/* ---------- 实时日志 ---------- */
+#log-panel { margin-top: 14px; }
+#log-panel summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; }
+#log-panel summary::-webkit-details-marker { display: none; }
+#log-box {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: #0f172a;
+  color: #cbd5e1;
+  border-radius: 8px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+#log-box .t { color: #64748b; }
+#log-box .err { color: #fca5a5; }
+#log-box .ok { color: #86efac; }

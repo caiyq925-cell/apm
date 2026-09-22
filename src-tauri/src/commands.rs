@@ -60,6 +60,7 @@ pub async fn query_metrics(
     apps: Vec<String>,
     metrics: Vec<MetricDef>,
 ) -> Result<Vec<AppMetrics>, String> {
+    reset_cancel();
     if config.instance_id.is_empty() {
         return Err("未配置业务系统 ID".into());
     }
@@ -192,6 +193,7 @@ pub async fn query_db_metrics(
     instances: Vec<String>,
     metrics: Vec<String>,
 ) -> Result<Vec<AppMetrics>, String> {
+    reset_cancel();
     if instances.is_empty() {
         return Err("未选择数据库实例".into());
     }
@@ -255,6 +257,30 @@ pub async fn query_db_metrics(
         });
     }
     Ok(out)
+}
+
+
+// ---------- 查询取消与进度日志 ----------
+use std::sync::atomic::{AtomicBool, Ordering};
+static CANCEL_FLAG: AtomicBool = AtomicBool::new(false);
+
+fn reset_cancel() {
+    CANCEL_FLAG.store(false, Ordering::SeqCst);
+}
+fn is_cancelled() -> bool {
+    CANCEL_FLAG.load(Ordering::SeqCst)
+}
+
+/// 结束查询（前端「停止」按钮）
+#[tauri::command]
+pub fn cancel_query() {
+    CANCEL_FLAG.store(true, Ordering::SeqCst);
+}
+
+/// 输出一条进度日志到前端
+fn log_to(app: &tauri::AppHandle, msg: impl Into<String>) {
+    use tauri::Emitter;
+    let _ = app.emit("query-log", msg.into());
 }
 
 // ---------- 容器服务（TKE） ----------
@@ -324,6 +350,7 @@ fn parse_mem_mib(s: &str) -> Option<f64> {
 }
 
 async fn container_query(
+    app: Option<tauri::AppHandle>,
     config: Config,
     cluster_id: String,
     namespace: String,
@@ -332,6 +359,11 @@ async fn container_query(
     end_ts: i64,
     apm_metrics: Vec<MetricDef>,
 ) -> Result<Vec<AppMetrics>, String> {
+    let log = |m: String| {
+        if let Some(a) = &app {
+            log_to(a, m);
+        }
+    };
     if deployments.is_empty() {
         return Err("未选择工作负载".into());
     }
@@ -350,7 +382,9 @@ async fn container_query(
         None
     };
     // 该命名空间的工作负载信息（SW_AGENT_NAME / limit / 副本）
+    log(format!("读取命名空间 {} 的工作负载列表…", namespace));
     let all = crate::container::list_deployments(&ch, &cluster_id, &namespace).await?;
+    log(format!("共 {} 个工作负载，开始逐个查询", all.len()));
     let info_map: std::collections::HashMap<String, crate::container::DeploymentInfo> =
         all.into_iter().map(|d| (d.name.clone(), d)).collect();
 
@@ -371,6 +405,10 @@ async fn container_query(
     let sem = Arc::new(tokio::sync::Semaphore::new(5));
     let mut join = tokio::task::JoinSet::new();
     for name in &deployments {
+        if is_cancelled() {
+            log("已停止：中断剩余工作负载查询".into());
+            break;
+        }
         let permit = sem.clone().acquire_owned().await.map_err(|e| e.to_string())?;
         let ch = ch.clone();
         let name = name.clone();
@@ -382,6 +420,7 @@ async fn container_query(
         let apm_instance = apm_instance.clone();
         let apm_instance_id = config.instance_id.clone();
         let fallback_ch = fallback_ch.clone();
+        let app_inner = app.clone();
         join.spawn(async move {
             let mut values: Vec<MetricValue> = Vec::new();
             let mut err: Option<String> = None;
@@ -398,6 +437,9 @@ async fn container_query(
             };
 
             // 1) 容器指标
+            if let Some(a) = &app_inner {
+                log_to(a, format!("{}: 读取 Pod 列表…", name));
+            }
             let (pods, ready) = match crate::container::deployment_pods(&ch, &cluster_id, &namespace, &name).await {
                 Ok(v) => v,
                 Err(e) => {
@@ -407,6 +449,9 @@ async fn container_query(
             };
             values.push(MetricValue { name: "pod_ready".into(), value: ready as f64 });
             values.push(MetricValue { name: "pod_desired".into(), value: info.replicas as f64 });
+            if let Some(a) = &app_inner {
+                log_to(a, format!("{}: 查询容器 CPU/内存利用率（{} 个 Pod）…", name, pods.len()));
+            }
             let fb = fallback_ch.as_deref();
             match crate::container::pod_util_metrics(&ch, fb, &cluster_id, &pods, start_ts, end_ts, &region).await {
                 Ok(list) => {
@@ -427,6 +472,9 @@ async fn container_query(
                 values.push(MetricValue { name: "mem_limit_mib".into(), value: m });
             }
 
+            if let Some(a) = &app_inner {
+                log_to(a, format!("{}: 查询 APM 指标（SW_AGENT_NAME={}）…", name, if info.apm_name.is_empty() { "-" } else { &info.apm_name }));
+            }
             // 2) APM 指标（SW_AGENT_NAME 严格匹配）
             if info.apm_name.is_empty() {
                 if err.is_none() {
@@ -545,8 +593,11 @@ pub async fn query_container_metrics(
     end_ts: i64,
     apm_metrics: Vec<MetricDef>,
 ) -> Result<Vec<AppMetrics>, String> {
+    reset_cancel();
+    log_to(&app, "开始统计…");
     let mut cfg = config.clone();
     let first = container_query(
+        Some(app.clone()),
         cfg.clone(),
         cluster_id.clone(),
         namespace.clone(),
@@ -565,6 +616,7 @@ pub async fn query_container_metrics(
     }
 
     // 通知前端：正在刷新会话
+    log_to(&app, "控制台会话已过期，正在打开登录窗口刷新会话（如未登录请扫码）…");
     {
         use tauri::Emitter;
         let _ = app.emit("session-refresh", "控制台会话已过期，正在刷新…");
@@ -579,7 +631,9 @@ pub async fn query_container_metrics(
     cfg.csrf_code = res.csrf_code;
     let _ = cfg.save();
 
+    log_to(&app, "会话已刷新，重新统计…");
     let second = container_query(
+        Some(app.clone()),
         cfg,
         cluster_id,
         namespace,

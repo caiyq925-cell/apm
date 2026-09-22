@@ -101,7 +101,7 @@ pub async fn wait_for_login() -> Result<LoginResult, String> {
     let mut cookie_req_id: Option<u64> = None;
     let mut last_cookie_poll = tokio::time::Instant::now();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         if tokio::time::Instant::now() > deadline {
             return Err("等待登录超时：请在登录窗口中完成扫码登录".into());

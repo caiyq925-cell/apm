@@ -25,6 +25,7 @@ fn main() {
             commands::list_namespaces,
             commands::list_deployments,
             commands::query_container_metrics,
+            commands::cancel_query,
             commands::start_cloud_login,
             commands::fetch_login_from_reqable
         ])

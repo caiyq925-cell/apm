@@ -13,6 +13,7 @@
     <button id="btn-query" class="btn-primary btn-big">
       <span class="btn-label">开始统计</span>
     </button>
+    <button id="btn-stop" class="btn-ghost hidden">停止</button>
   </header>
 
   <details id="settings" class="card anim-enter">
@@ -135,6 +136,14 @@
       </div>
     </div>
   </section>
+
+  <details id="log-panel" class="card anim-enter">
+    <summary>
+      <span class="card-title">实时日志</span>
+      <button class="btn-mini" id="btn-log-clear">清空</button>
+    </summary>
+    <pre id="log-box"></pre>
+  </details>
 
   <script src="vendor/anime.umd.min.js"></script>
   <script src="app.js"></script>
