@@ -327,6 +327,18 @@ pub async fn query_container_metrics(
         return Err("未选择工作负载".into());
     }
     let ch = Arc::new(Channel::from_config(&config)?);
+    // 配置了密钥时，额外准备一个官方 API 通道作为容器指标的兜底
+    let fallback_ch: Option<Arc<Channel>> = if !config.secret_id.is_empty() && !config.secret_key.is_empty() {
+        Some(Arc::new(Channel::Secret {
+            region: config.region.clone(),
+            cred: crate::tc3::Tc3Credential {
+                secret_id: config.secret_id.clone(),
+                secret_key: config.secret_key.clone(),
+            },
+        }))
+    } else {
+        None
+    };
     // 该命名空间的工作负载信息（SW_AGENT_NAME / limit / 副本）
     let all = crate::container::list_deployments(&ch, &cluster_id, &namespace).await?;
     let info_map: std::collections::HashMap<String, crate::container::DeploymentInfo> =
@@ -359,6 +371,7 @@ pub async fn query_container_metrics(
         let apm_by_view = apm_by_view.clone();
         let apm_instance = apm_instance.clone();
         let apm_instance_id = config.instance_id.clone();
+        let fallback_ch = fallback_ch.clone();
         join.spawn(async move {
             let mut values: Vec<MetricValue> = Vec::new();
             let mut err: Option<String> = None;
@@ -384,7 +397,8 @@ pub async fn query_container_metrics(
             };
             values.push(MetricValue { name: "pod_ready".into(), value: ready as f64 });
             values.push(MetricValue { name: "pod_desired".into(), value: info.replicas as f64 });
-            match crate::container::pod_util_metrics(&ch, &cluster_id, &pods, start_ts, end_ts, &region).await {
+            let fb = fallback_ch.as_deref();
+            match crate::container::pod_util_metrics(&ch, fb, &cluster_id, &pods, start_ts, end_ts, &region).await {
                 Ok(list) => {
                     for (k, v) in list {
                         values.push(MetricValue { name: k, value: v });

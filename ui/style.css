@@ -285,3 +285,43 @@ button:disabled { opacity: 0.5; cursor: wait; }
 }
 .result-block .err { color: var(--danger); }
 #action-bar { text-align: center; margin: 18px 0 4px; }
+
+/* ---------- 可搜索下拉（自定义 combobox） ---------- */
+.combo { position: relative; display: inline-block; }
+.combo > input { padding-right: 24px; cursor: text; }
+.combo::after {
+  content: "";
+  position: absolute;
+  right: 9px; top: 50%;
+  width: 0; height: 0;
+  margin-top: -1px;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid #7c8aa0;
+  pointer-events: none;
+}
+.combo-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0; right: 0;
+  max-height: 220px;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.14);
+  z-index: 40;
+  padding: 4px;
+}
+.combo-list.hidden { display: none; }
+.combo-item {
+  padding: 5px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combo-item:hover, .combo-item.hover { background: #eef4ff; }
+.combo-item.active { color: var(--primary); font-weight: 600; }
+.combo-empty { padding: 6px 9px; color: var(--muted); font-size: 12px; }

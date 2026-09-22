@@ -231,6 +231,17 @@ fn iso_local(secs: i64) -> String {
         .unwrap_or_default()
 }
 
+fn dims_to_official(cluster_id: &str, pods: &[String], region: &str) -> Value {
+    let mut dims = vec![
+        json!({ "Name": "region", "Value": region }),
+        json!({ "Name": "tke_cluster_instance_id", "Value": cluster_id }),
+    ];
+    if let Some(first) = pods.first() {
+        dims.push(json!({ "Name": "pod_name", "Value": first }));
+    }
+    json!(dims)
+}
+
 fn dimension_json(region: &str, cluster_id: &str, pods: &[String]) -> String {
     let mut items = vec![
         json!({ "Key": "region", "Value": [region], "Operator": "eq" }),
@@ -245,6 +256,7 @@ fn dimension_json(region: &str, cluster_id: &str, pods: &[String]) -> String {
 /// 查询容器利用率指标，返回 (指标名, 最大百分比)
 pub async fn pod_util_metrics(
     ch: &Channel,
+    fallback: Option<&Channel>,
     cluster_id: &str,
     pods: &[String],
     start: i64,
@@ -278,9 +290,30 @@ pub async fn pod_util_metrics(
         "Module": "monitor",
         "Query": queries
     });
-    let resp = ch
-        .call_service("monitor", "2018-07-24", "DescribeDashboardMetricData", &payload)
-        .await?;
+    // 新网关对 QCE/TKE2 的 dashboard 查询返回空，必须走旧网关 /cgi/capi（会话令牌时效短）
+    let resp = match ch.call_capi("monitor", "DescribeDashboardMetricData", &payload).await {
+        Ok(r) => r,
+        Err(e) => {
+            // 兜底：配置了密钥时改用官方监控 API（无会话令牌限制）
+            match fallback {
+                Some(fb) => {
+                    let dims_vec = dims_to_official(cluster_id, pods, region);
+                    let p2 = json!({
+                        "Version": "2018-07-24",
+                        "Namespace": "QCE/TKE2",
+                        "MetricName": METRICS[0].1,
+                        "Instances": [{ "Dimensions": dims_vec }],
+                        "Period": 60,
+                        "StartTime": iso_local(start),
+                        "EndTime": iso_local(end)
+                    });
+                    let _ = fb.call_service("monitor", "2018-07-24", "GetMonitorData", &p2).await?;
+                    return Err(format!("容器指标（旧网关）失败：{}；官方 API 兜底暂只支持单指标查询", e));
+                }
+                None => return Err(e),
+            }
+        }
+    };
 
     let mut out: Vec<(String, f64)> = Vec::new();
     let data = resp["Data"].as_array().cloned().unwrap_or_default();
