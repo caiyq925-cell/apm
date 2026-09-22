@@ -1257,6 +1257,30 @@ function bindConfigInputs() {
     if (all) { copyText(all, null); showOk("已复制全部"); }
   };
   $("btn-parse-curl").onclick = parseCurlFill;
+  $("btn-cloud-login").onclick = async () => {
+    $("login-result").textContent = "登录窗口已打开，请用微信扫码（登录成功后窗口会自动关闭）…";
+    try {
+      const c = await invoke("start_cloud_login", { config: cfg });
+      cfg = c;
+      applyLoginToUi();
+      $("login-result").textContent = "登录成功，会话信息已保存";
+      showOk("已获取登录信息");
+    } catch (e) {
+      $("login-result").textContent = String(e);
+    }
+  };
+  $("btn-login-reqable").onclick = async () => {
+    $("login-result").textContent = "正在从 Reqable 抓包中提取…";
+    try {
+      const c = await invoke("fetch_login_from_reqable", { config: cfg });
+      cfg = c;
+      applyLoginToUi();
+      $("login-result").textContent = "已从 Reqable 获取登录信息";
+      showOk("已更新登录信息");
+    } catch (e) {
+      $("login-result").textContent = String(e);
+    }
+  };
   $("btn-scenario-save").onclick = saveScenario;
   $("btn-scenario-delete").onclick = deleteScenario;
   $("btn-validate-cookie").onclick = async () => {
@@ -1267,6 +1291,17 @@ function bindConfigInputs() {
       $("cookie-result").textContent = String(e);
     }
   };
+}
+
+function applyLoginToUi() {
+  $("cookie").value = cfg.cookie || "";
+  $("uin").value = cfg.uin || "";
+  $("owner-uin").value = cfg.ownerUin || "";
+  $("csrf-code").value = cfg.csrfCode || "";
+  document.querySelector('input[name="auth"][value="cookie"]').checked = true;
+  $("auth-secret").classList.add("hidden");
+  $("auth-cookie").classList.remove("hidden");
+  updateSettingsHint();
 }
 
 function renderTimeUI() {

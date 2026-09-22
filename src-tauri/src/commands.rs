@@ -479,3 +479,55 @@ pub async fn query_container_metrics(
     }
     Ok(out)
 }
+
+// ---------- 登录（内嵌扫码窗口 / 从 Reqable 抓取） ----------
+
+/// 打开腾讯云官方登录页窗口，用户扫码登录后自动取回会话信息并保存
+#[tauri::command]
+pub async fn start_cloud_login(
+    app: tauri::AppHandle,
+    config: Config,
+) -> Result<Config, String> {
+    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    if let Some(w) = app.get_webview_window("cloud-login") {
+        let _ = w.close();
+    }
+    let url = crate::login::LOGIN_URL
+        .parse()
+        .map_err(|e| format!("登录地址无效: {}", e))?;
+    let args = format!("--remote-debugging-port={}", crate::login::CDP_PORT);
+    WebviewWindowBuilder::new(&app, "cloud-login", WebviewUrl::External(url))
+        .title("登录腾讯云（微信扫码，登录后自动关闭）")
+        .inner_size(1080.0, 760.0)
+        .additional_browser_args(&args)
+        .build()
+        .map_err(|e| format!("打开登录窗口失败: {}", e))?;
+
+    let res = crate::login::wait_for_login().await;
+    if let Some(w) = app.get_webview_window("cloud-login") {
+        let _ = w.close();
+    }
+    let res = res?;
+    let mut c = config;
+    c.cookie = res.cookie;
+    c.uin = res.uin;
+    c.owner_uin = res.owner_uin;
+    c.csrf_code = res.csrf_code;
+    c.auth_mode = "cookie".into();
+    c.save()?;
+    Ok(c)
+}
+
+/// 可选：从 Reqable 抓包提取登录信息（需要 Reqable 正在运行并抓过控制台请求）
+#[tauri::command]
+pub async fn fetch_login_from_reqable(config: Config) -> Result<Config, String> {
+    let info = crate::reqable::fetch_login_info("", 9000).await?;
+    let mut c = config;
+    c.cookie = info.cookie;
+    c.uin = info.uin;
+    c.owner_uin = info.owner_uin;
+    c.csrf_code = info.csrf_code;
+    c.auth_mode = "cookie".into();
+    c.save()?;
+    Ok(c)
+}

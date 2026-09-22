@@ -6,6 +6,8 @@ mod config;
 mod console;
 mod container;
 mod db;
+mod login;
+mod reqable;
 mod tc3;
 
 fn main() {
@@ -22,7 +24,9 @@ fn main() {
             commands::list_clusters,
             commands::list_namespaces,
             commands::list_deployments,
-            commands::query_container_metrics
+            commands::query_container_metrics,
+            commands::start_cloud_login,
+            commands::fetch_login_from_reqable
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
