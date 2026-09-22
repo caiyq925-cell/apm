@@ -21,6 +21,59 @@ pub struct DbInstance {
 }
 
 pub async fn list_db_instances(ch: &Channel, db_type: &str) -> Result<Vec<DbInstance>, String> {
+    // 优先用 DBbrain 的实例列表（与「数据库智能管家 → 实例管理」页面口径一致，覆盖更全：
+    // 实测 MySQL 95 个，而 CDB 接口只回 49 个）
+    match list_from_dbbrain(ch, db_type).await {
+        Ok(list) if !list.is_empty() => Ok(list),
+        Ok(_) => list_from_product_api(ch, db_type).await,
+        Err(e) => match list_from_product_api(ch, db_type).await {
+            Ok(list) if !list.is_empty() => Ok(list),
+            _ => Err(e),
+        },
+    }
+}
+
+async fn list_from_dbbrain(ch: &Channel, db_type: &str) -> Result<Vec<DbInstance>, String> {
+    let product = match db_type {
+        "mysql" | "redis" | "mongodb" => db_type,
+        _ => return Err(format!("不支持的数据库类型: {}", db_type)),
+    };
+    let mut out = Vec::new();
+    let (page_size, max_pages) = (100, 30);
+    for page in 0..max_pages {
+        let payload = json!({
+            "Version": "2019-10-16",
+            "Product": product,
+            "IsSupported": true,
+            "Limit": page_size,
+            "Offset": page * page_size
+        });
+        let resp = ch
+            .call_service("dbbrain", "2019-10-16", "DescribeDiagDBInstances", &payload)
+            .await?;
+        let mut got = 0;
+        if let Some(items) = resp["Items"].as_array() {
+            for it in items {
+                got += 1;
+                let id = it["InstanceId"].as_str().unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let name = it["InstanceName"].as_str().unwrap_or("").to_string();
+                if out.iter().any(|d: &DbInstance| d.id == id) {
+                    continue;
+                }
+                out.push(DbInstance { id, name });
+            }
+        }
+        if got < page_size {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+async fn list_from_product_api(ch: &Channel, db_type: &str) -> Result<Vec<DbInstance>, String> {
     let (service, version, action, list_key) = match db_type {
         "mysql" => ("cdb", "2017-03-20", "DescribeDBInstances", "Items"),
         "redis" => ("redis", "2018-04-12", "DescribeInstances", "InstanceSet"),
