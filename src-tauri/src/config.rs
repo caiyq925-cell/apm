@@ -64,7 +64,7 @@ pub struct Config {
 }
 
 fn default_sources() -> Vec<String> {
-    vec!["apm".to_string()]
+    vec!["container".to_string()]
 }
 
 impl Config {

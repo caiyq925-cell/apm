@@ -69,7 +69,7 @@ const APM_VIEWS = ["service_metric", "computed", "sql_metric", "mq_metric", "run
 const isApmView = (v) => APM_VIEWS.includes(v);
 
 // 数据源
-const SOURCE_ORDER = ["apm", "container", "mysql", "redis", "mongodb"];
+const SOURCE_ORDER = ["container", "mysql", "redis", "mongodb"];
 const SOURCE_NAMES = { apm: "APM 应用", container: "容器服务", mysql: "MySQL", redis: "Redis", mongodb: "MongoDB" };
 // 容器服务指标（TKE，占 limit 口径）
 const CONTAINER_METRICS = [
@@ -140,8 +140,8 @@ const DB_DEFAULT_SELECTED = {
 
 let cfg = null;
 let sourcesData = {}; // {type: [{name, label?, requestCount}]}
-let activeListTab = "apm";
-let activeMetricTab = "apm";
+let activeListTab = "container";
+let activeMetricTab = "container";
 let containerClusters = [];
 let containerNamespaces = [];
 let appFilterSelectedOnly = false;
@@ -431,7 +431,7 @@ function renderMetricTabs() {
     const badge = document.createElement("span");
     badge.className = "badge";
     badge.textContent = cfg.selectedMetrics.filter((m) =>
-      t === "apm" ? isApmView(m.view) : m.view === t
+      t === "container" ? m.view === "container" || isApmView(m.view) : m.view === t
     ).length;
     btn.appendChild(document.createTextNode(SOURCE_NAMES[t]));
     btn.appendChild(badge);
@@ -656,14 +656,17 @@ function renderMetrics() {
       list.appendChild(row);
     }
   };
-  if (t === "apm") {
+  if (t === "container") {
+    // 容器指标
+    addGroup("容器指标", CONTAINER_METRICS.map((d) => ({ ...d, view: "container" })));
+    // 关联的 APM 指标（按 SW_AGENT_NAME 严格匹配的应用）
     const defs = cfg.metricCache.length ? cfg.metricCache : DEFAULT_METRICS;
-    addGroup("应用指标", defs.filter((d) => d.view === "service_metric"));
-    addGroup("计算指标", defs.filter((d) => d.view === "computed"));
-    addGroup("SQL 调用", defs.filter((d) => d.view === "sql_metric"));
-    addGroup("MQ 消息", defs.filter((d) => d.view === "mq_metric"));
-    addGroup("JVM 运行时", defs.filter((d) => d.view === "runtime_metric"));
-    addGroup("实例指标（多实例取最大）", defs.filter((d) => d.view === "instance_metric"));
+    addGroup("APM 指标（应用指标）", defs.filter((d) => d.view === "service_metric"));
+    addGroup("APM 指标（计算）", defs.filter((d) => d.view === "computed"));
+    addGroup("APM 指标（实例：多实例取最大）", defs.filter((d) => d.view === "instance_metric"));
+    addGroup("APM 指标（SQL 调用）", defs.filter((d) => d.view === "sql_metric"));
+    addGroup("APM 指标（MQ 消息）", defs.filter((d) => d.view === "mq_metric"));
+    addGroup("APM 指标（JVM 运行时）", defs.filter((d) => d.view === "runtime_metric"));
   } else {
     addGroup(SOURCE_NAMES[t], DB_METRICS[t].map((d) => ({ ...d, view: t })));
   }
@@ -726,22 +729,8 @@ async function query() {
   if (!r) return showErr("时间范围无效");
 
   const tasks = [];
-  if (isEnabled("apm")) {
-    if (!cfg.instanceId) return showErr("APM 已启用，请先填写业务系统 ID");
-    if (!cfg.selectedApps.length) return showErr("APM 已启用，请先选择应用");
-    const metrics = cfg.selectedMetrics.filter((m) => isApmView(m.view));
-    if (!metrics.length) return showErr("APM 已启用，请先勾选指标");
-    tasks.push(
-      invoke("query_metrics", {
-        config: cfg,
-        startTs: r.start,
-        endTs: r.end,
-        apps: cfg.selectedApps,
-        metrics,
-      }).then((results) => ({ src: "apm", results }))
-    );
-  }
   if (isEnabled("container")) {
+    if (!cfg.instanceId) return showErr("请先在设置中填写业务系统 ID（关联 APM 需要）");
     if (!cfg.containerCluster || !cfg.containerNamespace) return showErr("容器服务已启用，请先选择集群与命名空间");
     if (!(cfg.selectedDeployments || []).length) return showErr("容器服务已启用，请先选择工作负载");
     if (!cfg.selectedMetrics.some((m) => m.view === "container")) return showErr("容器服务已启用，请先勾选容器指标");
@@ -1200,7 +1189,9 @@ async function init() {
   cfg = await invoke("load_config");
   if (!cfg.selectedMetrics.length) cfg.selectedMetrics = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!cfg.metricCache.length) cfg.metricCache = DEFAULT_METRICS.map((d) => ({ ...d }));
-  if (!cfg.enabledSources || !cfg.enabledSources.length) cfg.enabledSources = ["apm"];
+  if (!Array.isArray(cfg.enabledSources)) cfg.enabledSources = [];
+  cfg.enabledSources = cfg.enabledSources.filter((t) => SOURCE_ORDER.includes(t));
+  if (!cfg.enabledSources.length) cfg.enabledSources = ["container"];
   if (!cfg.scenarios) cfg.scenarios = [];
   if (!cfg.activeScenario) cfg.activeScenario = "";
   // 配置迁移：补充新增 APM 指标并统一顺序
@@ -1252,14 +1243,14 @@ async function init() {
   if (cfg.useCustom && cfg.customStart) $("custom-start").value = cfg.customStart;
   if (cfg.useCustom && cfg.customEnd) $("custom-end").value = cfg.customEnd;
   $("settings").open = !(cfg.cookie || cfg.secretId);
-  $("field-team").classList.toggle("hidden", !isEnabled("apm"));
+  $("field-team").classList.remove("hidden");
   updateSettingsHint();
 
   bindConfigInputs();
   renderScenarioChips();
   renderSourceChips();
   renderTimeUI();
-  activeListTab = cfg.enabledSources.find(isEnabled) || "apm";
+  activeListTab = cfg.enabledSources.find(isEnabled) || "container";
   activeMetricTab = activeListTab;
   renderTabs();
   renderApps(false);
