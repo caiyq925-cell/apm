@@ -707,7 +707,7 @@ function dbLines(app, range, src) {
   const has = (n) => cfg.selectedMetrics.some((m) => m.name === n && m.view === src);
   const p = range.dbPrefix;
   const defs = DB_METRICS[src];
-  const lines = [`**${app.name}**`, `统计窗口：${range.label}`];
+  const lines = [`**${app.name}**`];
 
   // MySQL 连接数特殊格式：当前/上限
   if (src === "mysql" && has("conn")) {
@@ -735,7 +735,7 @@ function dbLines(app, range, src) {
 }
 
 function apmLines(app, range) {
-  const lines = [`**服务名：${app.name}**`, `统计窗口：${range.label}`];
+  const lines = [`**服务名：${app.name}**`];
   const secs = Math.max(1, range.end - range.start);
   for (const d of cfg.selectedMetrics) {
     if (!["service_metric", "computed"].includes(d.view)) continue;
