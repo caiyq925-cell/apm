@@ -33,6 +33,7 @@ pub struct AppInfo {
 
 #[tauri::command]
 pub async fn list_apps(config: Config) -> Result<Vec<AppInfo>, String> {
+    let config = with_session(config);
     let ch = Channel::from_config(&config)?;
     let apps = apm::list_apps(&ch, &config.instance_id).await?;
     Ok(apps
@@ -420,6 +421,7 @@ fn console_channel(config: &Config) -> Result<Channel, String> {
 
 #[tauri::command]
 pub async fn list_clusters(config: Config) -> Result<Vec<crate::container::ClusterInfo>, String> {
+    let config = with_session(config);
     let ch = console_channel(&config)?;
     crate::container::list_clusters(&ch).await
 }
