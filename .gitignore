@@ -4,7 +4,17 @@ config.json
 *.log
 .DS_Store
 dist/
+__pycache__/
+*.pyc
 
 # 抓包导出（含会话凭证，禁止提交）
 tools/capture_dump.json
 tools/*.dump.json
+
+# 调试产物（截图 / 抓取的登录页 / 诊断输出）：一次性、体积大。
+# 诊断脚本本身与公共模块（_session.py / _capi.py / _cdp.py）照旧入库，见 docs/HANDOFF 第十节。
+tools/_*.png
+tools/_*.txt
+tools/_*.html
+tools/_*.js
+tools/_*.json
