@@ -31,23 +31,24 @@
 - **结果输出**：Markdown 渲染（应用/服务名加粗），一键复制**纯文本**（无 `**`），可「复制全部」
 - **实时日志面板**：输出查询进度（读了哪个工作负载、在查什么），出错标红、完成标绿
 - **停止按钮**：查询中可中断，后端会真正停止派发剩余任务，迟到结果被丢弃
-- **会话自动刷新**：容器利用率需要控制台会话（短时效），过期时自动打开登录窗口刷新并重试一次
-- **登录方式**：内置扫码登录窗口（腾讯官方页面）/ 从 Reqable 抓包提取 / 手动粘贴 cURL 解析
-- **配置便携化**：所有界面状态、场景、凭证都存 exe 同目录的 `config.json`
+- **会话自动刷新**：容器利用率需要控制台旧网关令牌（短时效），统计前隐藏预热；令牌失败时换新令牌重试一次，整次统计不会因容器利用率失败而中断
+- **登录方式**：只有内置扫码登录窗口（腾讯官方页面）；扫码后后端取回并保存 Cookie + csrfCode，前端不持有会话
+- **配置便携化**：用户配置存 exe 同目录的 `config.json`；会话字段由后端独有并与用户配置分开合并，保存不会被前端空值覆盖
+- **会话维护**：可配置后台自动刷新、提前刷新阈值、失败退避与连续失败上限
+- **实时日志**：后端进度事件依赖 `src-tauri/capabilities/default.json` 的 `core:default` 权限
 
 ---
 
 ## 二、快速开始（使用者）
 
 1. 下载 `apm-monitor_0.1.1_x64-setup.zip`（安装版）或直接使用绿色版目录；
-2. 首次打开 → 展开「设置」：
-   - **Cookie 方式（推荐）**：认证方式选 Cookie → 点「扫码登录腾讯云」，在弹窗里用微信扫码，登录成功后窗口自动关闭，会话信息自动填写；
-   - **密钥方式（指标更稳）**：填 SecretId / SecretKey（建议只读权限），容器/数据库指标优先走官方 API，不受会话过期影响；
-   - （可选）两者都填：K8s 资源列表用 Cookie，指标用密钥，体验最好；
+2. 首次打开 → 展开「设置」→ 点唯一的「扫码登录」按钮，在腾讯云官方窗口里完成扫码；
+   登录态成功取回后，窗口会关闭，会话由后端保存；
 3. 填「业务系统 ID」（APM 的 team，如 `apm-tHxaVZjHH`）；
-4. 勾选监控对象 → 选时间 → 勾指标 → 点「开始统计」。
+4. 按需选择数据源与监控对象 → 选时间 → 勾指标 → 点「开始统计」。
 
-> `config.json` 内含会话与密钥，**不要分享或提交到仓库**（`.gitignore` 已排除）。
+> `config.json` 内含控制台会话 Cookie 与 csrfCode，**不要分享或提交到仓库**（`.gitignore` 已排除）。
+> `uin` / `ownerUin` 不再单独存成字段，而是每次从 Cookie 派生。
 
 ---
 
@@ -64,8 +65,11 @@ npm run tauri dev    # 热重载开发
 
 ### 打包（Windows 单机）
 ```bash
-npm run tauri build
+npm run tauri build     # 或直接 cd src-tauri && cargo build --release（等价）
 ```
+> ⚠️ **界面全白时先别怀疑包**：那是 WebView2 用户数据目录被"强制结束进程"弄坏了。
+> 删掉 `%LOCALAPPDATA%\com.local.apmmonitor\EBWebView` 重启即可。
+> 自检：`python tools/smoke_gui.py`；调试时**不要用 `taskkill /F`**。
 产物：
 | 产物 | 路径 |
 |---|---|
@@ -109,18 +113,21 @@ apm-monitor/
 │   │   ├── main.rs         # Tauri 入口与命令注册
 │   │   ├── commands.rs     # 前端可调用的命令层（查询编排、取消、登录）
 │   │   ├── config.rs       # 便携式配置（config.json）+ 场景结构
-│   │   ├── tc3.rs          # 腾讯云官方 API：TC3-HMAC-SHA256 签名
+│   │   ├── cred.rs         # 会话失效与旧网关令牌失效的统一判定
+│   │   ├── capi.rs         # 旧网关令牌预热与缓存
 │   │   ├── console.rs      # 控制台新网关 BFF（Cookie 模式）
 │   │   ├── apm.rs          # APM 指标（应用/实例/SQL/MQ/JVM）
 │   │   ├── container.rs    # 容器服务（TKE：集群/命名空间/工作负载/Pod + 利用率）
 │   │   ├── db.rs           # MySQL / Redis / MongoDB 指标与实例列表
-│   │   ├── login.rs        # 内置扫码登录（登录窗口 + CDP 读取会话）
-│   │   └── reqable.rs      # 可选：从 Reqable 抓包提取会话（备选方案）
+│   │   └── login.rs        # 内置扫码登录（登录窗口 + CDP 读取会话）
+│   ├── capabilities/
+│   │   └── default.json    # Tauri v2 权限（含实时日志事件监听）
 │   ├── tauri.conf.json     # 应用与打包配置（NSIS + dmg/appimage/deb）
 │   └── icons/              # 全平台图标（由 npx tauri icon 生成）
 ├── dist/                   # 本地绿色版运行目录（已 gitignore）
-├── docs/DESIGN.md          # 接口与凭证设计说明（后续参考）
-└── tools/                  # 开发期辅助脚本（Reqable 抓包、批量补丁等）
+├── docs/DESIGN.md          # 会话模型、接口与指标设计说明（唯一口径）
+├── docs/HANDOFF-会话与登录改造.md # 会话改造交接与验证清单
+└── tools/                  # 诊断脚本（CDP、容器/接口排查、Reqable 导出）
 ```
 
 ---
@@ -130,7 +137,10 @@ apm-monitor/
 | 现象 | 原因 / 处理 |
 |---|---|
 | `WebView2Loader.dll 找不到` | 绿色版必须把 exe 与 `WebView2Loader.dll` 放同一目录 |
-| 顶部提示 `UnauthorizedOperation.CamNoAuth` | 密钥缺少对应产品权限（如 TKE/ccs）；资源列表已改走 Cookie，一般不会再出现 |
-| 容器利用率报 `code=1216 不合法的云 API 类型` | 控制台会话令牌过期（该指标只能由控制台 dashboard 接口提供）→ 工具会自动打开登录窗口刷新并重试；也可点「扫码登录腾讯云」手动刷新 |
+| 顶部提示 `UnauthorizedOperation.CamNoAuth` | 这是腾讯云服务端的权限/对象问题，不是登录方式；先确认当前扫码账号有对应资源权限 |
+| 容器利用率显示 `-` | 该指标只来自旧网关 dashboard；工具会先隐藏预热令牌（并抓 `x-lid`/`x-life` 两个头，抓包对齐），失败时自动换令牌重试一次。若仍失败，先看日志中的预热成功/失败提示（含 `x-lid 已取 / x-life 基准已取` 状态），再跑 `python tools/time_container.py` |
+| 旧网关返回 `code=1216` | 它可能是短寿命令牌未被接受，**不等于整机会话失效**；容器失败不会再中断数据库/APM 结果。请求必须带 `x-lid` 与新鲜的 `x-life` 头（工具已自动带）；仍失败先跑 `python tools/capi_in_browser.py` 区分令牌口径与请求载荷问题 |
 | 证书/杀软误报 | 未签名安装包的常见误报；可提交微软误报申诉或用绿色版 |
+| 界面全白、什么都没有 | WebView2 用户数据目录坏了，**不是包的问题**：删掉 `%LOCALAPPDATA%\com.local.apmmonitor\EBWebView` 重启即可。自检 `python tools/smoke_gui.py` |
+| 要排查问题时 | 日志同时写在 `dist/apm-monitor.log`（含启动标记与每条进度），直接看文件比截图快 |
 | macOS 首次打开被拦 | 包未签名公证，右键「打开」或在「隐私与安全性」里允许 |
