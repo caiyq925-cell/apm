@@ -249,8 +249,7 @@ button:disabled { opacity: 0.5; cursor: wait; }
 
 .check-list {
   margin-top: 6px;
-  height: 320px;
-  flex: 1;
+  height: 400px;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
