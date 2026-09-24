@@ -175,13 +175,8 @@ function snapshotSelection() {
 }
 
 function applySelection(snap) {
-  // 数据源：场景显式记录的 + 从内容反推的（兼容早期没有 sources 字段的老场景）
-  const sources = new Set((snap.sources || []).filter(Boolean));
-  if ((snap.apps || []).length) sources.add("apm");
-  for (const [k, v] of Object.entries(snap.dbInstances || {})) {
-    if ((v || []).length) sources.add(k);
-  }
-  if (sources.size) cfg.enabledSources = [...sources];
+  // 4 个数据源恒定全部展示，不再按场景收窄
+  cfg.enabledSources = [...SOURCE_ORDER];
   cfg.selectedApps = [...(snap.apps || [])];
   cfg.selectedDbInstances = JSON.parse(JSON.stringify(snap.dbInstances || {}));
   cfg.selectedDeployments = [...(snap.deployments || [])];
@@ -235,7 +230,9 @@ function renderScenarioChips() {
     box.appendChild(chip);
   }
   $("btn-scenario-delete").disabled = active === "自定义";
-  $("btn-scenario-save").textContent = active === "自定义" ? "存为场景" : "保存场景";
+  const saveLabel = active === "自定义" ? "存为场景" : "保存场景";
+  $("btn-scenario-save").textContent = saveLabel;
+  $("btn-scenario-save-2").textContent = saveLabel;
 }
 
 function switchScenario(name) {
@@ -259,7 +256,7 @@ function switchScenario(name) {
   $("app-search").value = "";
   setAppFilter(false);
   renderScenarioChips();
-  renderSourceChips();
+
   renderTabs();
   renderApps(false);
   renderMetrics();
@@ -388,47 +385,6 @@ function updateRangeHint() {
   $("range-hint").textContent = r ? `查询区间：${r.label}` : "请先设置有效的时间范围";
 }
 
-// ---------- 数据源 chips ----------
-function renderSourceChips() {
-  const box = $("source-chips");
-  box.innerHTML = "";
-  for (const t of SOURCE_ORDER) {
-    const chip = document.createElement("button");
-    chip.className = "chip" + (isEnabled(t) ? " active" : "");
-    chip.textContent = SOURCE_NAMES[t];
-    chip.onclick = () => {
-      const i = cfg.enabledSources.indexOf(t);
-      if (i >= 0) {
-        if (cfg.enabledSources.length === 1) return showErr("至少保留一个数据源");
-        cfg.enabledSources.splice(i, 1);
-        if (!isEnabled(activeListTab)) activeListTab = cfg.enabledSources[0];
-        if (!isEnabled(activeMetricTab)) activeMetricTab = cfg.enabledSources[0];
-      } else {
-        cfg.enabledSources.push(t);
-        if (t === "container") {
-          if (!(cfg.selectedMetrics || []).some((m) => m.view === t)) {
-            cfg.selectedMetrics.push(...CONTAINER_METRICS.map((d) => ({ ...d, view: t })));
-          }
-        } else if (t !== "apm" && !(cfg.selectedMetrics || []).some((m) => m.view === t)) {
-          cfg.selectedMetrics.push(
-            ...(DB_DEFAULT_SELECTED[t] || []).map((name) => {
-              const def = DB_METRICS[t].find((d) => d.name === name);
-              return { ...def, view: t };
-            })
-          );
-        }
-      }
-      renderSourceChips();
-      renderTabs();
-      renderApps(false);
-      renderMetrics();
-      updateSettingsHint();
-      scheduleSave();
-      if (isEnabled(t) && !sourcesData[t] && sessionReady) loadSources([t]);
-    };
-    box.appendChild(chip);
-  }
-}
 
 // ---------- Tab 页 ----------
 function renderTabs() {
@@ -920,11 +876,10 @@ async function query() {
   if (!r) return showErr("时间范围无效");
 
   const tasks = [];
-  if (isEnabled("container")) {
+  if ((cfg.selectedDeployments || []).length) {
     if (!cfg.instanceId) return showErr("请先在设置中填写业务系统 ID（关联 APM 需要）");
-    if (!cfg.containerCluster || !cfg.containerNamespace) return showErr("容器服务已启用，请先选择集群与命名空间");
-    if (!(cfg.selectedDeployments || []).length) return showErr("容器服务已启用，请先选择工作负载");
-    if (!cfg.selectedMetrics.some((m) => m.view === "container")) return showErr("容器服务已启用，请先勾选容器指标");
+    if (!cfg.containerCluster || !cfg.containerNamespace) return showErr("请先选择集群与命名空间");
+    if (!cfg.selectedMetrics.some((m) => m.view === "container")) return showErr("容器服务：请先勾选容器指标");
     tasks.push(
       invoke("query_container_metrics", {
         config: cfg,
@@ -938,10 +893,9 @@ async function query() {
     );
   }
   for (const t of ["mysql", "redis", "mongodb"]) {
-    if (!isEnabled(t)) continue;
     const instances = dbInstances(t);
-    if (!instances.length) return showErr(`${SOURCE_NAMES[t]} 已启用，请先选择实例`);
-    if (!cfg.selectedMetrics.some((m) => m.view === t)) return showErr(`${SOURCE_NAMES[t]} 已启用，请先勾选指标`);
+    if (!instances.length) continue;
+    if (!cfg.selectedMetrics.some((m) => m.view === t)) return showErr(`${SOURCE_NAMES[t]}：请先勾选指标`);
     tasks.push(
       invoke("query_db_metrics", {
           config: cfg,
@@ -953,7 +907,7 @@ async function query() {
         }).then((results) => ({ src: t, results }))
     );
   }
-  if (!tasks.length) return showErr("请先启用数据源并选择对象");
+  if (!tasks.length) return showErr("请先勾选要统计的对象（工作负载或数据库实例）");
 
   for (const id of ["btn-query", "btn-query-2"]) {
     const b = $(id);
@@ -1349,6 +1303,7 @@ function bindConfigInputs() {
     }
   };
   $("btn-scenario-save").onclick = saveScenario;
+  $("btn-scenario-save-2").onclick = saveScenario;
   $("btn-scenario-delete").onclick = deleteScenario;
 }
 
@@ -1418,9 +1373,7 @@ async function init() {
   delete cfg.sessionFetchedAt;
   if (!cfg.selectedMetrics.length) cfg.selectedMetrics = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!cfg.metricCache.length) cfg.metricCache = DEFAULT_METRICS.map((d) => ({ ...d }));
-  if (!Array.isArray(cfg.enabledSources)) cfg.enabledSources = [];
-  cfg.enabledSources = cfg.enabledSources.filter((t) => SOURCE_ORDER.includes(t));
-  if (!cfg.enabledSources.length) cfg.enabledSources = ["container"];
+  cfg.enabledSources = [...SOURCE_ORDER];
   if (!cfg.scenarios) cfg.scenarios = [];
   if (!cfg.activeScenario) cfg.activeScenario = "";
   // 配置迁移：补充新增 APM 指标并统一顺序
@@ -1480,7 +1433,7 @@ async function init() {
 
   bindConfigInputs();
   renderScenarioChips();
-  renderSourceChips();
+
   renderTimeUI();
   activeListTab = cfg.enabledSources.find(isEnabled) || "container";
   activeMetricTab = activeListTab;
