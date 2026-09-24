@@ -43,6 +43,11 @@ jobs:
       - name: Install frontend deps
         run: npm install
 
+      # 单测守的是会话/令牌判定的不变量（比如"旧网关 1216 不算会话失效"），
+      # 全是纯逻辑，不需要账号也不需要 GUI，三个平台都能跑。
+      - name: Run tests
+        run: cd src-tauri && cargo test
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

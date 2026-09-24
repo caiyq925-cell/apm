@@ -231,7 +231,14 @@ fn iso_local(secs: i64) -> String {
         .unwrap_or_default()
 }
 
-fn dimension_json(region: &str, cluster_id: &str, pods: &[String]) -> String {
+/// dashboard 接口的维度串。
+///
+/// **必须与控制台页面自己的请求逐字一致**（抓包核过，见 `tools/capture_dump.json`）：
+/// 控制台对容器利用率固定带 5 个维度 —— region / tke_cluster_instance_id / pod_name /
+/// **namespace** / **workload_name**。少一个都可能取不到数据；这里缺失的那两个
+/// 正是"容器利用率一直拿不到"的怀疑对象（接口本身是通的：抓包里
+/// `K8sPodRateCpuCoreUsedLimit` 的响应是 `code=0` 且有真实百分比）。
+fn dimension_json(region: &str, cluster_id: &str, namespace: &str, workload: &str, pods: &[String]) -> String {
     let mut items = vec![
         json!({ "Key": "region", "Value": [region], "Operator": "eq" }),
         json!({ "Key": "tke_cluster_instance_id", "Value": [cluster_id], "Operator": "in" }),
@@ -239,66 +246,49 @@ fn dimension_json(region: &str, cluster_id: &str, pods: &[String]) -> String {
     if !pods.is_empty() {
         items.push(json!({ "Key": "pod_name", "Value": pods, "Operator": "in" }));
     }
+    if !namespace.is_empty() {
+        items.push(json!({ "Key": "namespace", "Value": [namespace], "Operator": "eq" }));
+    }
+    if !workload.is_empty() {
+        items.push(json!({ "Key": "workload_name", "Value": [workload], "Operator": "eq" }));
+    }
     json!(items).to_string()
 }
 
-/// 查询容器利用率指标，返回 (指标名, 最大百分比)
-pub async fn pod_util_metrics(
-    ch: &Channel,
-    fallback: Option<&Channel>,
-    cluster_id: &str,
-    pods: &[String],
-    start: i64,
-    end: i64,
-    region: &str,
-) -> Result<Vec<(String, f64)>, String> {
-    const METRICS: [(&str, &str); 2] = [
-        ("cpu_util_limit", "K8sPodRateCpuCoreUsedLimit"),
-        ("mem_util_limit", "K8sPodRateMemNoCacheLimit"),
-    ];
-    let dims = dimension_json(region, cluster_id, pods);
-    let queries: Vec<Value> = METRICS
-        .iter()
-        .map(|(_, m)| {
-            json!({
-                "Datasource": "DS_QCEMetric",
-                "Namespace": "QCE/TKE2",
-                "MetricName": m,
-                "Conditions": [{ "Region": region, "Dimension": [dims] }],
-                "GroupBy": ["InstanceId"],
-                "StartTime": iso_local(start),
-                "EndTime": iso_local(end),
-                "QueryVersion": "2020-10-21"
-            })
-        })
-        .collect();
-    let payload = json!({
-        "Version": "2018-07-24",
-        "Language": "zh-CN",
-        "SpaceUUID": "space_default",
-        "Module": "monitor",
-        "Query": queries
-    });
-    // 优先：配置了密钥时走官方监控 API（长期有效，不受控制台会话令牌限制）
-    if let Some(fb) = fallback {
-        if let Ok(list) = official_util_metrics(fb, cluster_id, pods, start, end, region).await {
-            if !list.is_empty() {
-                return Ok(list);
-            }
-        }
+/// 与控制台一致的采样周期（QCE 只接受标准周期）。
+/// 控制台对 1 小时窗口用的就是 60（抓包核过），所以短窗口直接对齐；
+/// 长窗口必须放粗，否则 7 天 × 60s 会拉回上万个点。
+fn pick_period(start: i64, end: i64) -> i64 {
+    let secs = (end - start).max(0);
+    if secs <= 3600 {
+        60
+    } else if secs <= 6 * 3600 {
+        300
+    } else if secs <= 24 * 3600 {
+        3600
+    } else {
+        86400
     }
-    // 兜底：控制台旧网关 dashboard 接口（会话令牌时效短）
-    let resp = ch.call_capi("monitor", "DescribeDashboardMetricData", &payload).await?;
+}
 
-    let mut out: Vec<(String, f64)> = Vec::new();
-    let data = resp["Data"].as_array().cloned().unwrap_or_default();
-    for (key, metric) in METRICS {
+/// 容器利用率两个指标：(输出键, dashboard 指标名)
+const UTIL_METRICS: [(&str, &str); 2] = [
+    ("cpu_util_limit", "K8sPodRateCpuCoreUsedLimit"),
+    ("mem_util_limit", "K8sPodRateMemNoCacheLimit"),
+];
+
+/// 从 dashboard 响应的 `Data[]` 里取出两个利用率指标在窗口内的最大值。
+///
+/// 注意响应里 `Value` 是**字符串形式的 JSON 数组**（如 `"[1.6,null,1.8]"`），可能含 null。
+/// 抽成纯函数是为了能测——这段解析错了会静默变成"没有数据"，很难查。
+fn parse_util_data(data: &[Value]) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for (key, metric) in UTIL_METRICS {
         let mut max: Option<f64> = None;
-        for d in &data {
+        for d in data {
             if d["MetricName"].as_str() != Some(metric) {
                 continue;
             }
-            // Value 是 JSON 数组字符串，如 "[1.6,null,1.8]"
             let raw = d["Value"].as_str().unwrap_or("");
             if let Ok(vals) = serde_json::from_str::<Vec<Option<f64>>>(raw) {
                 for v in vals.into_iter().flatten() {
@@ -310,70 +300,159 @@ pub async fn pod_util_metrics(
             out.push((key.to_string(), m));
         }
     }
-    Ok(out)
+    out
 }
 
-
-/// 官方监控 API：按 Pod 维度取容器利用率（一次请求可带多个 Pod 实例）
-async fn official_util_metrics(
-    fb: &Channel,
+/// 查询容器利用率指标，返回 (指标名, 最大百分比)
+///
+/// 旧网关走**配置自助**：csrfCode = bkn(skey) 现算、Cookie 用配置会话（见 `apm::call_capi`），
+/// 不需要浏览器/预热窗口。脚本直发实测 `code=0` 且有数据；万一被网关拒（`is_capi_token_stale`），
+/// 才用 `app` 走退路——让隐藏的控制台页面自己发（见 `capi::fetch_dashboard`）。
+pub async fn pod_util_metrics(
+    ch: &Channel,
+    app: Option<&tauri::AppHandle>,
     cluster_id: &str,
+    namespace: &str,
+    workload: &str,
     pods: &[String],
     start: i64,
     end: i64,
     region: &str,
 ) -> Result<Vec<(String, f64)>, String> {
-    const METRICS: [(&str, &str); 2] = [
-        ("cpu_util_limit", "K8sPodRateCpuCoreUsedLimit"),
-        ("mem_util_limit", "K8sPodRateMemNoCacheLimit"),
-    ];
-    let instances: Vec<Value> = if pods.is_empty() {
-        vec![json!({ "Dimensions": [
-            { "Name": "region", "Value": region },
-            { "Name": "tke_cluster_instance_id", "Value": cluster_id }
-        ]})]
-    } else {
-        pods.iter()
-            .map(|p| {
-                json!({ "Dimensions": [
-                    { "Name": "region", "Value": region },
-                    { "Name": "tke_cluster_instance_id", "Value": cluster_id },
-                    { "Name": "pod_name", "Value": p }
-                ]})
+    let dims = dimension_json(region, cluster_id, namespace, workload, pods);
+    let period = pick_period(start, end);
+    let queries: Vec<Value> = UTIL_METRICS
+        .iter()
+        .map(|(_, m)| {
+            json!({
+                "Datasource": "DS_QCEMetric",
+                "Namespace": "QCE/TKE2",
+                "MetricName": m,
+                "Conditions": [{ "Region": region, "Dimension": [dims] }],
+                "GroupBy": ["InstanceId"],
+                "StartTime": iso_local(start),
+                "EndTime": iso_local(end),
+                // 控制台自己带 Period；缺了它取不到数据（抓包核过）
+                "Period": period,
+                "QueryVersion": "2020-10-21"
             })
-            .collect()
-    };
-
-    let mut out: Vec<(String, f64)> = Vec::new();
-    let mut last_err = String::new();
-    for (key, metric) in METRICS {
-        let payload = json!({
-            "Namespace": "QCE/TKE2",
-            "MetricName": metric,
-            "Instances": instances,
-            "Period": 60,
-            "StartTime": iso_local(start),
-            "EndTime": iso_local(end)
-        });
-        match fb.call_service("monitor", "2018-07-24", "GetMonitorData", &payload).await {
-            Ok(resp) => {
-                let mut max: Option<f64> = None;
-                for d in resp["DataPoints"].as_array().unwrap_or(&vec![]) {
-                    for v in d["Values"].as_array().unwrap_or(&vec![]) {
-                        if let Some(f) = v.as_f64() {
-                            max = Some(max.map_or(f, |m: f64| m.max(f)));
-                        }
+        })
+        .collect();
+    let payload = json!({
+        "Version": "2018-07-24",
+        "Language": "zh-CN",
+        "SpaceUUID": "space_default",
+        "Module": "monitor",
+        "Query": queries
+    });
+    // 只有控制台旧网关 dashboard 接口能给出容器利用率（官方 API 对 QCE/TKE2 无数据，已实测）
+    match ch
+        .call_capi("monitor", "DescribeDashboardMetricData", &payload)
+        .await
+    {
+        Ok(resp) => {
+            let data = resp["Data"].as_array().cloned().unwrap_or_default();
+            Ok(parse_util_data(&data))
+        }
+        Err(e) if crate::cred::is_capi_token_stale(&e) => {
+            // 脚本直发被网关拒 → 退到"让页面自己发"。只在网关拒了我们时走这条路：
+            // 网络类错误走它也没用，白等 30 秒。
+            let Some(a) = app else { return Err(e) };
+            match crate::capi::fetch_dashboard(a, ch.config(), "monitor", "DescribeDashboardMetricData", &payload).await {
+                Ok(data) => {
+                    let arr = data.as_array().cloned().unwrap_or_default();
+                    let out = parse_util_data(&arr);
+                    if out.is_empty() {
+                        Err(format!("{}；退路：页面里发成功了但没解析出数据", e))
+                    } else {
+                        Ok(out)
                     }
                 }
-                if let Some(m) = max {
-                    out.push((key.to_string(), m));
-                }
+                Err(e2) => Err(format!("{}；退路也失败：{}", e, e2)),
             }
-            Err(e) => last_err = e,
         }
+        Err(e) => Err(e),
     }
-    if out.is_empty() && !last_err.is_empty() {
-        return Err(last_err);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 控制台自己的 dashboard 请求固定带这 5 个维度（tools/capture_dump.json 核过）。
+    /// 少维度是"容器利用率一直拿不到"的头号怀疑对象，所以钉死在这里。
+    #[test]
+    fn dimension_json_has_all_five_dims_the_console_sends() {
+        let s = dimension_json(
+            "ap-shanghai",
+            "cls-abc",
+            "inc",
+            "inc-center",
+            &["p1".to_string(), "p2".to_string()],
+        );
+        let v: Value = serde_json::from_str(&s).unwrap();
+        let keys: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["Key"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["region", "tke_cluster_instance_id", "pod_name", "namespace", "workload_name"]
+        );
+        assert_eq!(v[0]["Operator"], "eq");
+        assert_eq!(v[1]["Operator"], "in");
+        assert_eq!(v[2]["Value"], json!(["p1", "p2"]));
+        assert_eq!(v[3]["Value"], json!(["inc"]));
+        assert_eq!(v[4]["Value"], json!(["inc-center"]));
     }
-    Ok(out)
+
+    #[test]
+    fn dimension_json_omits_empty_optional_dims() {
+        let s = dimension_json("ap-shanghai", "cls-abc", "", "", &[]);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2, "只该剩 region + cluster");
+    }
+
+    /// 控制台对 1 小时窗口用的就是 60（抓包核过）；长窗口必须放粗，否则点数爆炸
+    #[test]
+    fn period_matches_console_for_short_windows() {
+        assert_eq!(pick_period(0, 3600), 60);
+        assert_eq!(pick_period(0, 6 * 3600), 300);
+        assert_eq!(pick_period(0, 24 * 3600), 3600);
+        assert_eq!(pick_period(0, 7 * 24 * 3600), 86400);
+        // 反向/零窗口不应 panic
+        assert_eq!(pick_period(100, 0), 60);
+    }
+
+    /// 响应里 `Value` 是**字符串形式的 JSON 数组**（可能含 null），取窗口内所有点的最大值
+    #[test]
+    fn parse_util_data_takes_max_across_points() {
+        let resp = json!({ "Data": [
+            { "MetricName": "K8sPodRateCpuCoreUsedLimit", "Value": "[1.6,null,1.8]" },
+            { "MetricName": "K8sPodRateCpuCoreUsedLimit", "Value": "[0.4]" },
+            { "MetricName": "K8sPodRateMemNoCacheLimit", "Value": "[55.5,60.1]" },
+            { "MetricName": "K8sPodRestartTotal", "Value": "[999]" }
+        ]});
+        let data = resp["Data"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            parse_util_data(&data),
+            vec![
+                ("cpu_util_limit".to_string(), 1.8),
+                ("mem_util_limit".to_string(), 60.1),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_util_data_empty_when_metric_missing_or_unparsable() {
+        let other = json!([{ "MetricName": "K8sPodRestartTotal", "Value": "[1]" }]);
+        assert!(parse_util_data(other.as_array().unwrap()).is_empty());
+
+        let blank = json!([{ "MetricName": "K8sPodRateCpuCoreUsedLimit", "Value": "" }]);
+        assert!(parse_util_data(blank.as_array().unwrap()).is_empty());
+
+        assert!(parse_util_data(&[]).is_empty());
+    }
 }

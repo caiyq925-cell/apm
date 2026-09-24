@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"主窗口默认权限：核心插件（含事件 listen，用于接收后端进度日志）","local":true,"windows":["main"],"permissions":["core:default"]}}

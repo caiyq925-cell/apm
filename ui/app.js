@@ -1,5 +1,13 @@
 // APM 监控前端逻辑（多数据源：APM / MySQL / Redis / MongoDB 可同时启用）
 const { invoke } = window.__TAURI__.core;
+
+// 会话由后端维护：凭证失效时后端会在错误里带这个标记（控制字符，界面上不可见），
+// 前端据此中断本次统计并让后端拉起扫码窗口。
+const CRED_MARK = "\u0001CRED\u0001";
+const hasCred = (e) => String(e == null ? "" : e).includes(CRED_MARK);
+const clean = (e) => String(e == null ? "" : e).split(CRED_MARK).join("");
+// 当前会话是否可用（由 renderSessionState 更新，前端不再持有 cookie/csrfCode）
+let sessionReady = false;
 const { animate, stagger } = window.anime;
 
 const REGIONS = [
@@ -82,6 +90,7 @@ const CONTAINER_METRICS = [
   { name: "cpu_limit_cores", cn: "CPU limit", unit: "核" },
   { name: "mem_limit_mib", cn: "内存 limit", unit: "MiB" },
 ];
+
 const DB_TITLES = { mysql: "MySQL 实例", redis: "Redis 实例", mongodb: "MongoDB 实例" };
 // 数据库指标目录（全部经真实实例实测可用）
 const DB_METRICS = {
@@ -257,7 +266,7 @@ function switchScenario(name) {
   updateSettingsHint();
   scheduleSave();
   // 场景切换后，自动加载该场景启用但尚未拉取过列表的数据源
-  if ((cfg.cookie || cfg.secretId)) {
+  if (sessionReady) {
     const missing = cfg.enabledSources.filter((t) => isEnabled(t) && !sourcesData[t]);
     if (missing.length) loadSources(missing);
   }
@@ -311,31 +320,44 @@ function deleteScenario() {
   showOk(`场景「${name}」已删除`);
 }
 
+function setStatus(msg, kind) {
+  const s = $("status");
+  s.className = kind || "";
+  s.textContent = msg || "";
+}
+
 function showErr(e) {
-  $("status").classList.remove("ok");
-  $("status").textContent = String(e);
+  setStatus(String(e), "err");
 }
 
 function showOk(msg) {
-  $("status").classList.add("ok");
-  $("status").textContent = msg;
-  setTimeout(() => { if ($("status").textContent === msg) $("status").textContent = ""; }, 5000);
+  setStatus(msg, "ok");
+  setTimeout(() => { if ($("status").textContent === msg) setStatus("", ""); }, 5000);
 }
 
 // ---------- 实时日志 ----------
 let logCount = 0;
-function logLine(msg, kind) {
+// persist=true 时同时把这一行发给后端落盘（dist/apm-monitor.log）。
+// 后端自己产生的行已经由后端落过盘了，所以事件监听那条路要传 persist=false，避免重复。
+function logLine(msg, kind, persist = true) {
+  if (persist) {
+    try {
+      invoke("log_ui", { msg: clean(msg) }).catch(() => {});
+    } catch (_) {}
+  }
   const box = $("log-box");
   if (!box) return;
   const now = new Date();
   const t = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
   const line = document.createElement("div");
   if (kind) line.className = kind;
-  line.innerHTML = `<span class="t">[${t}]</span> ${String(msg).replace(/</g, "&lt;")}`;
+  line.innerHTML = `<span class="t">[${t}]</span> ${clean(msg).replace(/</g, "&lt;")}`;
+  // 只有本来就在底部附近才跟随新行；往上翻历史时不被拽回底部
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
   box.appendChild(line);
   logCount += 1;
   while (box.childElementCount > 400) box.removeChild(box.firstChild);
-  box.scrollTop = box.scrollHeight;
+  if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 
 // ---------- 时间 ----------
@@ -402,7 +424,7 @@ function renderSourceChips() {
       renderMetrics();
       updateSettingsHint();
       scheduleSave();
-      if (isEnabled(t) && !sourcesData[t] && (cfg.cookie || cfg.secretId)) loadSources([t]);
+      if (isEnabled(t) && !sourcesData[t] && sessionReady) loadSources([t]);
     };
     box.appendChild(chip);
   }
@@ -434,7 +456,7 @@ function renderListTabs() {
       renderMetricTabs();
       renderMetrics();
       renderApps(false);
-      if (!sourcesData[t] && (cfg.cookie || cfg.secretId)) loadSources([t]);
+      if (!sourcesData[t] && sessionReady) loadSources([t]);
     };
     box.appendChild(btn);
   }
@@ -843,16 +865,31 @@ function fmtValue(name, v) {
   return fmtCount(v);
 }
 
-// ---------- 查询与 Markdown 展示 ----------
-function mdEscape(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+// ---------- 查询与结果展示 ----------
+// 结果区在日志上方。重绘会先清空再插入，文档高度先塌再长，浏览器会把 scrollY 钳到新的底部，
+// 看日志的人就被甩回上面。所以只要日志面板还在视口里，就按它的屏幕位置钉住，而不是按高度差补偿。
+function keepViewStable(fn) {
+  const log = $("log-panel");
+  if (!log) {
+    fn();
+    return;
+  }
+  const before = log.getBoundingClientRect().top;
+  const viewH = window.innerHeight || document.documentElement.clientHeight;
+  const pin = before < viewH && before + log.offsetHeight > 0;
+  fn();
+  if (!pin) return;
+  const shift = log.getBoundingClientRect().top - before;
+  if (Math.abs(shift) >= 1) window.scrollBy(0, shift);
 }
 
-function mdRender(md) {
-  // 极简 Markdown：**加粗** + 换行
-  return mdEscape(md)
-    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
-    .replace(/\n/g, "<br>");
+// 错误/异常类指标：>0 标红，错误率为 0 标绿
+function valueTone(label, value) {
+  const badWords = ["错误率", "异常", "错误数", "慢查询", "驱逐", "回滚"];
+  if (!badWords.some((w) => label.includes(w))) return "";
+  const n = parseFloat(value);
+  if (!isFinite(n) || n <= 0) return label.includes("错误率") ? " good" : "";
+  return " bad";
 }
 
 let queryTimer = null;
@@ -865,8 +902,7 @@ function startQueryUi() {
   if (queryTimer) clearInterval(queryTimer);
   queryTimer = setInterval(() => {
     const s = Math.round((Date.now() - startedAt) / 1000);
-    $("status").classList.remove("ok");
-    $("status").textContent = `统计中… 已用时 ${s}s（可点「停止」中断）`;
+    setStatus(`统计中… 已用时 ${s}s（可点「停止」中断）`, "busy");
   }, 1000);
   logLine("开始统计…", "ok");
 }
@@ -925,26 +961,69 @@ async function query() {
     b.classList.add("loading");
   }
   startQueryUi();
+  const t0 = Date.now();
   const myToken = queryToken;
+  // 按下标占位保证渲染顺序稳定；每个数据源返回就先渲染，不再等全部完成
+  const groups = new Array(tasks.length);
+  let done = 0;
+  let aborted = false;
+  // 会话失效：立刻中断本次统计（后端真取消），并让后端拉起扫码窗口——不等扫码，
+  // 扫完由用户重新点「开始统计」（Q3/Q15）。
+  const interrupt = () => {
+    if (aborted) return;
+    aborted = true;
+    queryToken += 1; // 让迟到结果失效
+    invoke("cancel_query").catch(() => {});
+    invoke("notify_session_invalid").catch(() => {});
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    logLine(`统计中断：需要重新登录（已打开登录窗口，扫完请重新点「开始统计」），耗时 ${secs}s`, "err");
+    setStatus("已中断：需要重新登录", "err");
+    const hint = $("results-progress");
+    if (hint) hint.remove();
+    endQueryUi();
+    for (const id of ["btn-query", "btn-query-2"]) {
+      const b = $(id);
+      b.disabled = false;
+      b.classList.remove("loading");
+    }
+  };
+  const renderPartial = () => {
+    if (myToken !== queryToken) return; // 已停止：不再刷新界面
+    renderResults(groups.filter(Boolean), r, `正在统计…（${done}/${tasks.length} 个数据源已返回）`);
+  };
+  renderPartial();
   try {
-    const settled = await Promise.allSettled(tasks);
+    await Promise.all(
+      tasks.map((p, i) =>
+        p.then(
+          (v) => {
+            groups[i] = v;
+            if ((v.results || []).some((r) => hasCred(r.error))) interrupt();
+          },
+          (e) => {
+            const msg = String(e);
+            if (hasCred(msg)) {
+              interrupt();
+              return;
+            }
+            logLine(`查询出错：${clean(msg)}`, "err");
+            groups[i] = { src: "error", results: [], error: msg };
+          }
+        ).then(() => { done += 1; renderPartial(); })
+      )
+    );
+    if (aborted) return;
     if (myToken !== queryToken) {
       logLine("本次查询已停止，忽略返回结果");
       return;
     }
-    const groups = [];
-    for (const s of settled) {
-      if (s.status === "fulfilled") groups.push(s.value);
-      else {
-        const msg = String(s.reason);
-        logLine(`查询出错：${msg}`, "err");
-        groups.push({ src: "error", results: [], error: msg });
-      }
-    }
-    renderResults(groups, r);
-    const total = groups.reduce((n, g) => n + g.results.length, 0);
-    logLine(`统计完成：${total} 个对象`, "ok");
-    showOk(`统计完成：${total} 个对象`);
+    const doneGroups = groups.filter(Boolean);
+    renderResults(doneGroups, r);
+    const total = doneGroups.reduce((n, g) => n + g.results.length, 0);
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    logLine(`统计完成：${total} 个对象，耗时 ${secs}s`, "ok");
+    showOk(`统计完成：${total} 个对象，耗时 ${secs}s`);
+    refreshSessionState();
   } catch (e) {
     logLine(`统计失败：${e}`, "err");
     showErr(e);
@@ -1000,7 +1079,7 @@ function dbLines(app, range, src) {
     if (d.hideIfEmpty && val === undefined) continue;
     lines.push(`${d.noPrefix ? "" : p}${d.cn}：${fmtDb(d, val)}`);
   }
-  if (app.error) lines.push(`（查询出错：${app.error}）`);
+  if (app.error) lines.push(`（查询出错：${clean(app.error)}）`);
   return lines;
 }
 
@@ -1024,7 +1103,7 @@ function apmLines(app, range) {
     }
     lines.push(`${label}：${text}`);
   }
-  if (app.error) lines.push(`（查询出错：${app.error}）`);
+  if (app.error) lines.push(`（查询出错：${clean(app.error)}）`);
   return lines;
 }
 
@@ -1066,53 +1145,99 @@ function containerLines(app, range) {
     const txt = memLim >= 1024 ? `${Math.round((memLim / 1024) * 10) / 10}GB`.replace(".0GB", "GB") : `${fmtCount(memLim)}MB`;
     lines.push(`内存：${txt}`);
   }
-  if (app.error) lines.push("（" + app.error + "）");
+  if (app.error) lines.push("（" + clean(app.error) + "）");
   return lines;
 }
 
-function renderResults(groups, range) {
+function renderResults(groups, range, progress) {
   const box = $("results");
-  box.innerHTML = "";
-  const blocks = [];
-  for (const g of groups) {
-    if (g.src === "error") {
-      blocks.push([`**（${g.error}）**`]);
-      continue;
+  keepViewStable(() => {
+    box.innerHTML = "";
+    if (progress) {
+      const hint = document.createElement("div");
+      hint.id = "results-progress";
+      hint.className = "muted";
+      hint.style.padding = "10px 2px";
+      hint.textContent = progress;
+      box.appendChild(hint);
     }
-    for (const app of g.results) {
-      blocks.push(
-        g.src === "apm" ? apmLines(app, range)
-          : g.src === "container" ? containerLines(app, range)
-            : dbLines(app, range, g.src)
-      );
+    const blocks = [];
+    for (const g of groups) {
+      if (g.src === "error") {
+        blocks.push([`**（${clean(g.error)}）**`]);
+        continue;
+      }
+      for (const app of g.results) {
+        blocks.push(
+          g.src === "apm" ? apmLines(app, range)
+            : g.src === "container" ? containerLines(app, range)
+              : dbLines(app, range, g.src)
+        );
+      }
     }
-  }
-  for (const lines of blocks) {
-    const md = lines.join("\n");
-    // 复制输出为纯文本（去掉 Markdown 加粗符号）
-    const plain = lines.map((l) => l.replace(/\*\*/g, "")).join("\n");
+    for (const lines of blocks) {
+      // 复制输出为纯文本（去掉 Markdown 加粗符号）——口径不随界面结构变化
+      const plain = lines.map((l) => l.replace(/\*\*/g, "")).join("\n");
 
-    const block = document.createElement("div");
-    block.className = "result-block";
-    const html = document.createElement("div");
-    html.dataset.md = plain;
-    html.innerHTML = mdRender(md);
-    block.appendChild(html);
-    const btn = document.createElement("button");
-    btn.className = "btn-mini copy";
-    btn.textContent = "复制";
-    btn.onclick = () => copyText(plain, btn);
-    block.appendChild(btn);
-    box.appendChild(block);
-  }
-  animate(".result-block", {
-    translateY: [24, 0],
-    opacity: [0, 1],
-    scale: [0.98, 1],
-    delay: stagger(90),
-    duration: 500,
-    ease: "outExpo",
+      const block = document.createElement("div");
+      block.className = "result-block";
+      const content = document.createElement("div");
+      content.className = "rb-content";
+      content.dataset.md = plain;
+
+      const head = document.createElement("div");
+      head.className = "rb-head";
+      const title = document.createElement("span");
+      title.className = "rb-title";
+      title.textContent = lines[0].replace(/\*\*/g, "");
+      const btn = document.createElement("button");
+      btn.className = "btn-mini copy";
+      btn.textContent = "复制";
+      btn.onclick = () => copyText(plain, btn);
+      head.appendChild(title);
+      head.appendChild(btn);
+      content.appendChild(head);
+
+      for (const raw of lines.slice(1)) {
+        const text = raw.replace(/\*\*/g, "");
+        const row = document.createElement("div");
+        const i = text.indexOf("：");
+        if (text.startsWith("（")) {
+          row.className = "rb-row rb-err";
+          row.textContent = text;
+        } else if (i < 0) {
+          row.className = "rb-row";
+          row.textContent = text;
+        } else {
+          row.className = "rb-row";
+          const label = text.slice(0, i);
+          const value = text.slice(i + 1);
+          const k = document.createElement("span");
+          k.className = "k";
+          k.textContent = label;
+          const v = document.createElement("span");
+          v.className = "v" + valueTone(label, value);
+          v.textContent = value;
+          row.appendChild(k);
+          row.appendChild(v);
+        }
+        content.appendChild(row);
+      }
+      block.appendChild(content);
+      box.appendChild(block);
+    }
   });
+  // 中途渲染不放动画，避免每个数据源回来都整体重放一遍
+  if (!progress) {
+    animate(".result-block", {
+      translateY: [24, 0],
+      opacity: [0, 1],
+      scale: [0.98, 1],
+      delay: stagger(90),
+      duration: 500,
+      ease: "outExpo",
+    });
+  }
 }
 
 async function copyText(text, btn) {
@@ -1133,132 +1258,17 @@ async function copyText(text, btn) {
   }
 }
 
-// ---------- curl 粘贴解析 ----------
-// 兼容 Windows cmd 版（^" ^& ^% 转义）与 bash 版（"..." '...'）两种 Copy as cURL 格式
-function parseCurl(text) {
-  // 去掉 cmd 转义符 ^（^\^" → \" 恰好是正确的引号转义）
-  const s = text.replace(/\r?\n\s*/g, " ").replace(/\^(.)/g, "$1");
-  const toks = [];
-  let i = 0;
-  while (i < s.length) {
-    while (s[i] === " ") i++;
-    if (i >= s.length) break;
-    let cur = "";
-    while (i < s.length && s[i] !== " ") {
-      const c = s[i];
-      if (c === '"') {
-        i++;
-        while (i < s.length && s[i] !== '"') {
-          if (s[i] === "\\" && (s[i + 1] === '"' || s[i + 1] === "\\")) { cur += s[i + 1]; i += 2; }
-          else { cur += s[i]; i++; }
-        }
-        i++;
-      } else if (c === "'") {
-        i++;
-        while (i < s.length && s[i] !== "'") { cur += s[i]; i++; }
-        i++;
-      } else { cur += c; i++; }
-    }
-    toks.push(cur);
-  }
-
-  const out = { url: "", cookie: "", team: "", rid: "", isApmApi: false };
-  for (let k = 0; k < toks.length; k++) {
-    const t = toks[k];
-    if (t === "--url" && toks[k + 1]) { out.url = toks[k + 1]; k++; }
-    else if (t === "-b" || t === "--cookie") { out.cookie = toks[k + 1] || ""; k++; }
-    else if (t === "-H") {
-      const h = toks[k + 1] || ""; k++;
-      const m = h.match(/^cookie:\s*(.+)$/i);
-      if (m) out.cookie = m[1].trim();
-    } else if (t === "curl" || t.startsWith("-")) { /* skip */ }
-    else if (!out.url) out.url = t;
-  }
-  if (!out.url) return out;
-
-  let params;
-  try { params = new URL(out.url).searchParams; } catch { return out; }
-  out.isApmApi = /console-hc\.cloud\.tencent\.com\/_api\/apm\//.test(out.url);
-  out.uin = params.get("uin") || "";
-  out.ownerUin = params.get("ownerUin") || "";
-  out.csrfCode = params.get("csrfCode") || "";
-
-  // team / rid 藏在 URL 自身、referer 头或 from 参数里（可能多层编码），在全文本中搜
-  const hunt = (name) => {
-    const direct = params.get(name);
-    if (direct) return direct;
-    const deep = decodeURIComponentSafe(s).match(new RegExp(`[?&]${name}=([^&"'\\s]+)`));
-    return deep ? deep[1] : "";
-  };
-  out.team = hunt("team");
-  out.rid = hunt("rid");
-  return out;
-}
-
-function decodeURIComponentSafe(s) {
-  try { return decodeURIComponent(s); } catch { return s; }
-}
-
-function parseCurlFill() {
-  const text = $("curl-paste").value;
-  if (!text.trim()) { $("curl-result").textContent = "请先粘贴 curl"; return; }
-  const r = parseCurl(text);
-
-  if (r.cookie) { $("cookie").value = r.cookie; cfg.cookie = r.cookie; }
-  if (r.uin) $("uin").value = r.uin;
-  if (r.ownerUin) $("owner-uin").value = r.ownerUin;
-  if (r.csrfCode) $("csrf-code").value = r.csrfCode;
-  if (!r.uin || !r.ownerUin) { const p = parseCookieIds(cfg.cookie || ""); if (!$("uin").value && p.uin) $("uin").value = p.uin; if (!$("owner-uin").value && p.ownerUin) $("owner-uin").value = p.ownerUin; }
-  if (r.team) $("instance-id").value = r.team;
-  if (r.rid) $("region-id").value = parseInt(r.rid) || cfg.regionId;
-  cfg.uin = $("uin").value.trim();
-  cfg.ownerUin = $("owner-uin").value.trim();
-  cfg.csrfCode = $("csrf-code").value.trim();
-  cfg.instanceId = $("instance-id").value.trim();
-  cfg.regionId = parseInt($("region-id").value) || 4;
-  scheduleSave();
-
-  const has = (v) => (v ? "✓" : "✗");
-  let msg = `Cookie ${has(r.cookie)}　uin ${has(cfg.uin)}　ownerUin ${has(cfg.ownerUin)}　csrfCode ${has(cfg.csrfCode)}　team ${cfg.instanceId ? "✓ " + cfg.instanceId : "✗"}　regionId ${cfg.regionId}`;
-  if (!r.isApmApi && !r.cookie) {
-    msg += "　⚠ 这不是 _api/apm/ 接口请求且提不到 Cookie：请在 F12 网络面板找 console-hc.cloud.tencent.com/_api/apm/… 的请求，「复制为 cURL」再贴一次";
-  }
-  $("curl-result").textContent = msg;
-}
-
-function parseCookieIds(cookieStr) {
-  const out = {};
-  for (const pair of cookieStr.split(";")) {
-    const i = pair.indexOf("=");
-    if (i < 0) continue;
-    const k = pair.slice(0, i).trim();
-    const v = pair.slice(i + 1).trim();
-    if (k === "uin") out.uin = v.replace(/^[oO]/, "");
-    if (k === "ownerUin") out.ownerUin = v.replace(/^[oO]/, "").replace(/[gG]$/, "");
-  }
-  return out;
-}
-
 // ---------- 事件绑定与初始化 ----------
 function bindConfigInputs() {
   $("region").onchange = () => { cfg.region = $("region").value; scheduleSave(); };
   $("region-id").oninput = () => { cfg.regionId = parseInt($("region-id").value) || 4; scheduleSave(); };
   $("instance-id").oninput = () => { cfg.instanceId = $("instance-id").value.trim(); scheduleSave(); };
-  $("secret-id").oninput = () => { cfg.secretId = $("secret-id").value.trim(); scheduleSave(); };
-  $("secret-key").oninput = () => { cfg.secretKey = $("secret-key").value; scheduleSave(); };
-  $("uin").oninput = () => { cfg.uin = $("uin").value.trim(); scheduleSave(); };
-  $("owner-uin").oninput = () => { cfg.ownerUin = $("owner-uin").value.trim(); scheduleSave(); };
-  $("csrf-code").oninput = () => { cfg.csrfCode = $("csrf-code").value.trim(); scheduleSave(); };
-  $("cookie").oninput = () => { cfg.cookie = $("cookie").value; scheduleSave(); };
-  for (const radio of document.querySelectorAll('input[name="auth"]')) {
-    radio.onchange = () => {
-      if (!radio.checked) return;
-      cfg.authMode = radio.value;
-      $("auth-secret").classList.toggle("hidden", radio.value !== "secret");
-      $("auth-cookie").classList.toggle("hidden", radio.value !== "cookie");
-      scheduleSave();
-    };
-  }
+  // 会话维护（更多里）：会话本身由后端维护，这里只改策略
+  $("sess-refresh-min").oninput = () => { cfg.sessionRefreshMinutes = Math.max(1, parseInt($("sess-refresh-min").value) || 10); scheduleSave(); };
+  $("sess-backoff-min").oninput = () => { cfg.sessionRefreshBackoffMinutes = Math.max(1, parseInt($("sess-backoff-min").value) || 2); scheduleSave(); };
+  $("sess-max-fails").oninput = () => { cfg.sessionRefreshMaxFails = Math.max(1, parseInt($("sess-max-fails").value) || 3); scheduleSave(); };
+  $("sess-auto-refresh").onchange = () => { cfg.sessionAutoRefresh = $("sess-auto-refresh").checked; scheduleSave(); };
+  $("sess-auto-quick-login").onchange = () => { cfg.sessionAutoQuickLogin = $("sess-auto-quick-login").checked; scheduleSave(); };
   for (const chip of $("quick-ranges").querySelectorAll(".chip")) {
     chip.onclick = () => {
       cfg.useCustom = false;
@@ -1310,13 +1320,15 @@ function bindConfigInputs() {
     logLine("已请求停止（后台正在收尾）…", "err");
     invoke("cancel_query").catch(() => {});
     endQueryUi();
+    // 撤掉「正在统计…」提示，已到达的结果保留
+    const hint = $("results-progress");
+    if (hint) hint.remove();
     for (const id of ["btn-query", "btn-query-2"]) {
       const b = $(id);
       b.disabled = false;
       b.classList.remove("loading");
     }
-    $("status").classList.remove("ok");
-    $("status").textContent = "已停止";
+    setStatus("已停止", "");
   };
   $("btn-log-clear").onclick = () => { $("log-box").innerHTML = ""; logCount = 0; };
   $("btn-query").onclick = query;
@@ -1325,52 +1337,50 @@ function bindConfigInputs() {
     const all = [...document.querySelectorAll(".result-block > div")].map((d) => d.dataset.md).join("\n\n");
     if (all) { copyText(all, null); showOk("已复制全部"); }
   };
-  $("btn-parse-curl").onclick = parseCurlFill;
   $("btn-cloud-login").onclick = async () => {
-    $("login-result").textContent = "登录窗口已打开，请用微信扫码（登录成功后窗口会自动关闭）…";
+    $("session-state").textContent = "登录窗口已打开，请扫码（登录后窗口自动关闭）…";
     try {
-      const c = await invoke("start_cloud_login", { config: cfg });
-      cfg = c;
-      applyLoginToUi();
-      $("login-result").textContent = "登录成功，会话信息已保存";
-      showOk("已获取登录信息");
+      await invoke("start_cloud_login");
+      await refreshSessionState();
+      showOk("已更新会话");
     } catch (e) {
-      $("login-result").textContent = String(e);
-    }
-  };
-  $("btn-login-reqable").onclick = async () => {
-    $("login-result").textContent = "正在从 Reqable 抓包中提取…";
-    try {
-      const c = await invoke("fetch_login_from_reqable", { config: cfg });
-      cfg = c;
-      applyLoginToUi();
-      $("login-result").textContent = "已从 Reqable 获取登录信息";
-      showOk("已更新登录信息");
-    } catch (e) {
-      $("login-result").textContent = String(e);
+      await refreshSessionState();
+      logLine(`扫码登录失败：${clean(e)}`, "err");
     }
   };
   $("btn-scenario-save").onclick = saveScenario;
   $("btn-scenario-delete").onclick = deleteScenario;
-  $("btn-validate-cookie").onclick = async () => {
-    $("cookie-result").textContent = "校验中…";
-    try {
-      $("cookie-result").textContent = await invoke("validate_cookie", { config: cfg });
-    } catch (e) {
-      $("cookie-result").textContent = String(e);
-    }
-  };
 }
 
-function applyLoginToUi() {
-  $("cookie").value = cfg.cookie || "";
-  $("uin").value = cfg.uin || "";
-  $("owner-uin").value = cfg.ownerUin || "";
-  $("csrf-code").value = cfg.csrfCode || "";
-  document.querySelector('input[name="auth"][value="cookie"]').checked = true;
-  $("auth-secret").classList.add("hidden");
-  $("auth-cookie").classList.remove("hidden");
+// ---------- 会话状态 ----------
+function fmtAge(secs) {
+  if (secs < 60) return `${secs} 秒前`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟前`;
+  return `${Math.floor(secs / 3600)} 小时前`;
+}
+
+function fmtWhen(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderSessionState(st, first) {
+  sessionReady = !!st.ready;
+  const age = st.fetchedAt ? fmtAge(st.ageSecs) : "-";
+  $("session-state").textContent = st.ready
+    ? `已登录 · uin ${st.uin || "-"} · 会话获取于 ${st.fetchedAt ? fmtWhen(st.fetchedAt) : "-"}（${age}）`
+    : "未登录 · 点左侧「扫码登录」";
+  if (first) $("settings").open = !st.ready;
   updateSettingsHint();
+}
+
+async function refreshSessionState(first) {
+  try {
+    renderSessionState(await invoke("session_status"), first);
+  } catch (e) {
+    $("session-state").textContent = "会话状态读取失败：" + clean(e);
+  }
 }
 
 function renderTimeUI() {
@@ -1383,8 +1393,7 @@ function renderTimeUI() {
 
 function updateSettingsHint() {
   const ds = (cfg.enabledSources || []).map((t) => SOURCE_NAMES[t] || t).join(" + ");
-  const auth = cfg.authMode === "cookie" ? "Cookie 模式" : "密钥模式";
-  $("settings-hint").textContent = `已启用：${ds}（${auth}）`;
+  $("settings-hint").textContent = `已启用：${ds}`;
 }
 
 async function init() {
@@ -1403,6 +1412,10 @@ async function init() {
   }
 
   cfg = await invoke("load_config");
+  // 会话字段由后端独有：前端不再持有，避免任何形式的回写把它弄坏
+  delete cfg.cookie;
+  delete cfg.csrfCode;
+  delete cfg.sessionFetchedAt;
   if (!cfg.selectedMetrics.length) cfg.selectedMetrics = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!cfg.metricCache.length) cfg.metricCache = DEFAULT_METRICS.map((d) => ({ ...d }));
   if (!Array.isArray(cfg.enabledSources)) cfg.enabledSources = [];
@@ -1452,18 +1465,16 @@ async function init() {
   $("region").value = cfg.region || "ap-shanghai";
   $("region-id").value = cfg.regionId ?? 4;
   $("instance-id").value = cfg.instanceId || "";
-  $("secret-id").value = cfg.secretId || "";
-  $("secret-key").value = cfg.secretKey || "";
-  $("cookie").value = cfg.cookie || "";
-  $("uin").value = cfg.uin || "";
-  $("owner-uin").value = cfg.ownerUin || "";
-  $("csrf-code").value = cfg.csrfCode || "";
-  document.querySelector(`input[name="auth"][value="${cfg.authMode === "cookie" ? "cookie" : "secret"}"]`).checked = true;
-  $("auth-secret").classList.toggle("hidden", cfg.authMode === "cookie");
-  $("auth-cookie").classList.toggle("hidden", cfg.authMode !== "cookie");
+
+  $("sess-refresh-min").value = cfg.sessionRefreshMinutes || 10;
+  $("sess-backoff-min").value = cfg.sessionRefreshBackoffMinutes || 2;
+  $("sess-max-fails").value = cfg.sessionRefreshMaxFails || 3;
+  $("sess-auto-refresh").checked = cfg.sessionAutoRefresh !== false;
+  $("sess-auto-quick-login").checked = cfg.sessionAutoQuickLogin !== false;
+  refreshSessionState(true);
   if (cfg.useCustom && cfg.customStart) $("custom-start").value = cfg.customStart;
   if (cfg.useCustom && cfg.customEnd) $("custom-end").value = cfg.customEnd;
-  $("settings").open = !(cfg.cookie || cfg.secretId);
+
   $("field-team").classList.remove("hidden");
   updateSettingsHint();
 
@@ -1487,19 +1498,24 @@ async function init() {
   });
 
   // 配置齐全时自动加载所有已启用数据源的列表
-  if (cfg.secretId || cfg.cookie) {
+  if (sessionReady) {
     loadSources(cfg.enabledSources.filter(isEnabled));
   }
 }
 
 // 监听后端事件：进度日志 / 会话刷新
-try {
-  window.__TAURI__.event.listen("query-log", (e) => logLine(e.payload));
-  window.__TAURI__.event.listen("session-refresh", (e) => {
-    logLine(String(e.payload || ""), "err");
-    $("status").classList.remove("ok");
-    $("status").textContent = String(e.payload || "");
-  });
-} catch (_) {}
+// listen 返回 Promise，被 ACL 拒绝时是异步失败——同步 try/catch 抓不到，必须 catch 出来
+function listenBackendEvents() {
+  const ev = window.__TAURI__ && window.__TAURI__.event;
+  if (!ev) {
+    logLine("无法监听后端事件：window.__TAURI__.event 不存在（后端进度日志不会显示）", "err");
+    return;
+  }
+  // persist=false：这条是后端发来的，后端已经把它落过盘了，别再落一次
+  ev.listen("query-log", (e) => logLine(e.payload, undefined, false))
+    .catch((e) => logLine(`监听后端进度日志失败（后端日志不会显示）：${e}`, "err"));
+
+}
+listenBackendEvents();
 
 init().catch(showErr);

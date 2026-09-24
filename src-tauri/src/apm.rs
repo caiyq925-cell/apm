@@ -1,43 +1,29 @@
-// 腾讯云 APM 数据访问层：统一封装「密钥模式（官方 OpenAPI）」与「Cookie 模式（控制台私有接口）」
-// 文档: https://cloud.tencent.com/document/api/1463/64936
+// 腾讯云 APM 数据访问层：只有 Cookie 通道（控制台私有接口）。
+// 官方密钥模式已移除——容器利用率等能力只有控制台链路有对应接口。
 use crate::config::{Config, MetricDef};
 use crate::console;
-use crate::tc3::{call_api, Tc3Credential};
+use crate::cred;
 use serde_json::{json, Value};
 
-pub enum Channel {
-    Secret { region: String, cred: Tc3Credential },
-    Cookie(Config),
+pub struct Channel {
+    cfg: Config,
 }
 
 impl Channel {
     pub fn from_config(cfg: &Config) -> Result<Channel, String> {
-        match cfg.auth_mode.as_str() {
-            "cookie" => {
-                if cfg.cookie.trim().is_empty() {
-                    return Err("Cookie 模式未配置 Cookie".into());
-                }
-                Ok(Channel::Cookie(cfg.clone()))
-            }
-            _ => {
-                if cfg.secret_id.is_empty() || cfg.secret_key.is_empty() {
-                    return Err("未配置 SecretId/SecretKey，请先在设置中填写并保存".into());
-                }
-                Ok(Channel::Secret {
-                    region: cfg.region.clone(),
-                    cred: Tc3Credential { secret_id: cfg.secret_id.clone(), secret_key: cfg.secret_key.clone() },
-                })
-            }
+        if cfg.cookie.trim().is_empty() {
+            return Err(cred::cred("未登录：请先在设置里点「扫码登录」"));
         }
+        Ok(Channel { cfg: cfg.clone() })
+    }
+
+    /// 只读访问配置（容器利用率退路需要 region/cluster 等参数）
+    pub fn config(&self) -> &Config {
+        &self.cfg
     }
 
     async fn call(&self, action: &str, payload: &Value) -> Result<Value, String> {
-        match self {
-            Channel::Secret { region, cred } => {
-                call_api(region, "apm", "2021-06-22", action, payload, cred).await
-            }
-            Channel::Cookie(cfg) => console::call_console(cfg, "apm", "2021-06-22", action, payload.clone()).await,
-        }
+        console::call_console(&self.cfg, "apm", "2021-06-22", action, payload.clone()).await
     }
 
     /// 通用服务调用（APM 之外的产品：monitor/cdb/redis/mongodb/dbbrain）
@@ -48,14 +34,7 @@ impl Channel {
         action: &str,
         payload: &Value,
     ) -> Result<Value, String> {
-        match self {
-            Channel::Secret { region, cred } => {
-                call_api(region, service, version, action, payload, cred).await
-            }
-            Channel::Cookie(cfg) => {
-                console::call_console(cfg, service, version, action, payload.clone()).await
-            }
-        }
+        console::call_console(&self.cfg, service, version, action, payload.clone()).await
     }
 }
 
@@ -278,73 +257,75 @@ mod tests {
 }
 
 impl Channel {
-    /// 控制台旧网关 /cgi/capi（容器监控 dashboard 指标等只有这条链路可用）
-    /// 注意：该网关的 csrfCode/sts 会话令牌时效较短，过期会返回 code=1216
-    pub async fn call_capi(&self, service: &str, cmd: &str, data: &Value) -> Result<Value, String> {
-        match self {
-            Channel::Secret { region, cred } => {
-                call_api(region, service, "2018-07-24", cmd, data, cred).await
-            }
-            Channel::Cookie(cfg) => {
-                let (uin, owner) = cfg.extract_ids_from_cookie();
-                if uin.is_empty() || owner.is_empty() {
-                    return Err("无法确定 uin/ownerUin：请检查 Cookie 或在设置中手动填写".into());
-                }
-                if cfg.csrf_code.is_empty() {
-                    return Err("缺少 csrfCode：请在控制台复制一条请求的 cURL，用「解析并填充」更新".into());
-                }
-                let inner = json!({
-                    "cmd": cmd,
-                    "serviceType": service,
-                    "data": data,
-                    "regionId": cfg.region_id
-                });
-                let body = json!({
-                    "text": inner.to_string(),
-                    "mime": "application/json",
-                    "encoding": "utf8"
-                });
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let url = format!(
-                    "https://console.cloud.tencent.com/cgi/capi?cmd={}&action=delegate&serviceType={}&secure=1&version=3&json=1&dictId=2006&sts=1&t={}&uin={}&ownerUin={}&csrfCode={}",
-                    cmd, service, now_ms, uin, owner, cfg.csrf_code
-                );
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let resp = client
-                    .post(url)
-                    .header("Content-Type", "application/json")
-                    .header("Origin", "https://console.cloud.tencent.com")
-                    .header("Referer", "https://console.cloud.tencent.com/tke2/cluster")
-                    .header("X-Requested-With", "XMLHttpRequest")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
-                    .header("Cookie", &cfg.cookie)
-                    .body(body.to_string())
-                    .send()
-                    .await
-                    .map_err(|e| format!("请求失败: {}", e))?;
-                let text = resp.text().await.map_err(|e| e.to_string())?;
-                let v: Value = serde_json::from_str(&text)
-                    .map_err(|_| format!("响应非 JSON: {}", text.chars().take(200).collect::<String>()))?;
-                if v["code"].as_i64().unwrap_or(-1) != 0 {
-                    let hint = if v["code"].as_i64() == Some(1216) {
-                        "（控制台会话令牌已过期：请在浏览器刷新一次控制台页面，复制任一请求的 cURL 到工具里「解析并填充」后重试）"
-                    } else {
-                        ""
-                    };
-                    return Err(format!("控制台接口错误 code={}: {}{}", v["code"], v["msg"].as_str().unwrap_or(""), hint));
-                }
-                let d = &v["data"];
-                if d["data"]["Response"].is_object() {
-                    Ok(d["data"]["Response"].clone())
-                } else if d["Response"].is_object() {
-                    Ok(d["Response"].clone())
-                } else {
-                    Ok(d["data"].clone())
-                }
-            }
+    /// 控制台旧网关 /cgi/capi（容器监控 dashboard 指标只有这条链路有）
+    ///
+    /// **完全配置自助**：csrfCode 用 `bkn(skey)` 现算（抓包实锤，见 `config::capi_csrf`），
+    /// Cookie 用配置里的会话，不需要浏览器/预热窗口/`x-lid`/`x-life`——实测这套组合
+    /// 直发旧网关返回 `code=0` 且有数据。
+    ///
+    /// 请求形态对齐控制台（抓包核过）：
+    /// - 请求体 = 内层 JSON **直接发**（`{"cmd":..,"serviceType":..,"data":{..},"regionId":4}`），
+    ///   绝不能包 `{"text":"..."}`——包了网关解析不到顶层 `cmd`，回 `code=1216 不合法的云 API 类型`
+    ///   （这是 1216 的真根因，曾长期被误读成令牌失效/TLS/会话问题）；
+    /// - URL 里**不要**加 `json=1`。
+    pub async fn call_capi(
+        &self,
+        service: &str,
+        cmd: &str,
+        data: &Value,
+    ) -> Result<Value, String> {
+        let cfg = &self.cfg;
+        let (uin, owner) = cfg.extract_ids_from_cookie();
+        if uin.is_empty() || owner.is_empty() {
+            return Err(cred::cred("无法确定 uin/ownerUin：当前会话不完整，请重新登录"));
+        }
+        let csrf_code = cfg.capi_csrf();
+        if csrf_code.trim().is_empty() {
+            return Err(cred::cred("缺少 csrfCode：请重新登录"));
+        }
+        let body = json!({ "cmd": cmd, "serviceType": service, "data": data, "regionId": cfg.region_id });
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let url = format!(
+            "https://console.cloud.tencent.com/cgi/capi?cmd={}&action=delegate&serviceType={}&secure=1&version=3&dictId=2006&sts=1&t={}&uin={}&ownerUin={}&csrfCode={}",
+            cmd, service, now_ms, uin, owner, csrf_code
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("Origin", "https://console.cloud.tencent.com")
+            .header("Referer", "https://console.cloud.tencent.com/tke2/cluster")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
+            .header("Cookie", &cfg.cookie)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("请求失败: {}", e))?;
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|_| format!("响应非 JSON: {}", text.chars().take(200).collect::<String>()))?;
+        let code = v["code"].as_i64().unwrap_or(-1);
+        if code != 0 {
+            let msg = v["msg"].as_str().unwrap_or("");
+            // 这里**不**标 cred：这个网关的 9/1216 只说明"它自己的短寿命令牌没被接受"，
+            // 实测换一份全新会话也照样 1216，不代表整机会话失效——标了会把整次统计中断掉，
+            // 把其它已经拿到的结果一起丢掉。
+            return Err(format!(
+                "旧网关接口错误 code={}: {}（容器 CPU/内存利用率依赖该网关的短寿命令牌）",
+                code, msg
+            ));
+        }
+        let d = &v["data"];
+        if d["data"]["Response"].is_object() {
+            Ok(d["data"]["Response"].clone())
+        } else if d["Response"].is_object() {
+            Ok(d["Response"].clone())
+        } else {
+            Ok(d["data"].clone())
         }
     }
 }

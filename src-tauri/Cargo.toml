@@ -19,6 +19,16 @@ tokio-tungstenite = "0.24"
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Tauri 官方脚手架的惯例：production 构建开 custom-protocol（`npx tauri build` 会自动带上）。
+# 这里放进 default，是为了让 `cargo build --release` 与 `npx tauri build` 产出一致，
+# 不必记两条不同的命令。
+#
+# 注意：它**不是**"界面全白"的原因。白屏的真因是 WebView2 用户数据目录被强杀弄坏，
+# 见 docs/HANDOFF-会话与登录改造.md 坑九；排查白屏请用 `python tools/smoke_gui.py`。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [profile.release]
 strip = true
 lto = true
